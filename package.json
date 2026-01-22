@@ -1,0 +1,19 @@
+{
+  "name": "@anthropic/mesh-router-gateway",
+  "version": "0.1.0",
+  "description": "Lightweight HTTP reverse proxy gateway with dynamic domain resolution",
+  "private": true,
+  "scripts": {
+    "build": "docker build -t mesh-router-gateway .",
+    "dev": "docker-compose -f dev/docker-compose.yml up --build",
+    "dev:stop": "docker-compose -f dev/docker-compose.yml down"
+  },
+  "keywords": [
+    "gateway",
+    "reverse-proxy",
+    "openresty",
+    "nginx",
+    "lua"
+  ],
+  "license": "MIT"
+}

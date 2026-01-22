@@ -1,0 +1,25 @@
+--[[
+    config.lua - Configuration for mesh-router-gateway
+
+    This file is generated at container startup from config.lua.template
+    using envsubst to replace environment variables.
+]]
+
+local config = {}
+
+-- Server domain suffix (e.g., "example.com", "nsl.sh")
+config.server_domain = "${SERVER_DOMAIN}"
+
+-- Backend URL for domain resolution API
+config.backend_url = "${BACKEND_URL}"
+
+-- Cache TTL in seconds
+config.cache_ttl = ${CACHE_TTL}
+
+-- Static routing overrides (optional)
+config.override = {}
+
+-- Default backend (used as fallback)
+config.default = "${DEFAULT_BACKEND}"
+
+return config

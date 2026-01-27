@@ -91,7 +91,7 @@ local function resolve_from_backend_v2(subdomain)
             ["Content-Type"] = "application/json",
             ["Accept"] = "application/json",
         },
-        ssl_verify = false,  -- TODO: Enable in production with proper CA bundle
+        ssl_verify = true,  -- TODO: Enable in production with proper CA bundle
     })
 
     if not res then
@@ -126,7 +126,7 @@ local function resolve_from_backend_v1(subdomain)
             ["Content-Type"] = "application/json",
             ["Accept"] = "application/json",
         },
-        ssl_verify = false,
+        ssl_verify = true,
     })
 
     if not res then
@@ -252,7 +252,7 @@ local function check_route_health(route, user_domain)
             ["Host"] = host_header,
             ["X-Health-Check"] = "1",
         },
-        ssl_verify = false,
+        ssl_verify = true,
     })
 
     if not res then

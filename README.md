@@ -34,7 +34,7 @@ A lightweight HTTP reverse proxy gateway for self-hosted infrastructure. Receive
                    │                                 │
                    ▼                                 ▼
            ┌─────────────┐                ┌───────────────────┐
-           │   Backend   │                │  meta-mesh-tunnel │
+           │   Backend   │                │  mesh-router-tunnel │
            │   Server    │                │       (hub)       │
            │  (public)   │                │         │         │
            └─────────────┘                │    WireGuard      │
@@ -67,9 +67,9 @@ When the backend server has a public IP, the resolution backend returns that IP 
 Client → Gateway → 203.0.113.5:443 → Backend Server
 ```
 
-### Via meta-mesh-tunnel
+### Via mesh-router-tunnel
 
-When the backend server is behind NAT/CGNAT/firewall, the resolution backend returns the tunnel hub IP. The [meta-mesh-tunnel](../meta-mesh-tunnel) project handles the actual tunneling:
+When the backend server is behind NAT/CGNAT/firewall, the resolution backend returns the tunnel hub IP. The [mesh-router-tunnel](../mesh-router-tunnel) project handles the actual tunneling:
 
 ```
 Client → Gateway → Hub (10.77.0.x) ──WireGuard──► Leaf → Backend Server
@@ -249,10 +249,10 @@ mesh-router-gateway/
 | Component | Responsibility |
 |-----------|----------------|
 | **mesh-router-gateway** (this) | HTTP reverse proxy, SSL termination, domain resolution |
-| **meta-mesh-tunnel** | WireGuard VPN hub/leaf for NAT traversal |
+| **mesh-router-tunnel** | WireGuard VPN hub/leaf for NAT traversal |
 | **resolution backend** | Domain-to-IP mapping storage and API |
 
-The gateway is intentionally simple and stateless. All tunneling complexity is delegated to meta-mesh-tunnel, which the gateway interacts with like any other IP destination.
+The gateway is intentionally simple and stateless. All tunneling complexity is delegated to mesh-router-tunnel, which the gateway interacts with like any other IP destination.
 
 ## Comparison with Similar Projects
 
@@ -268,7 +268,7 @@ The gateway is intentionally simple and stateless. All tunneling complexity is d
 | Project | Purpose |
 |---------|---------|
 | [mesh-router-backend](../mesh-router-backend) | Domain registration & resolution API |
-| [meta-mesh-tunnel](../meta-mesh-tunnel) | WireGuard VPN hub/leaf for NAT traversal |
+| [mesh-router-tunnel](../mesh-router-tunnel) | WireGuard VPN hub/leaf for NAT traversal |
 | [selfhosted-gateway](https://github.com/hintjen/selfhosted-gateway) | Similar self-hosted tunneling solution |
 
 ## License

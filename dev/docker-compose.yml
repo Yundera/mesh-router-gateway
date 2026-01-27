@@ -1,22 +1,40 @@
-version: '3.8'
+# mesh-router-gateway Development Stack
+#
+# Usage:
+#   cp .env.example .env
+#   # Edit .env with your values
+#   docker compose up -d
+#
+# This stack can run in two modes:
+#   1. Standalone: Gateway only, connecting to remote backend
+#   2. Full stack: Gateway + local backend + Redis
 
 services:
+  # =============================================================================
+  # MESH ROUTER GATEWAY
+  # HTTP reverse proxy with dynamic domain resolution
+  # =============================================================================
   gateway:
     build:
       context: ..
       args:
         BUILD_VERSION: ${BUILD_VERSION:-dev}
+    container_name: mesh-router-gateway-dev
+    hostname: mesh-router-gateway
     ports:
       - "8080:80"
     networks:
-      - gateway-ipv6
+      - gateway-dev
     environment:
-      # Domain suffix for routing
-      - SERVER_DOMAIN=${SERVER_DOMAIN:-inojob.com}
-      # Resolution backend API URL (staging server)
-      - BACKEND_URL=${BACKEND_URL:-https://inojob.com/router/api}
+      # Domain suffix for routing (e.g., nsl.sh, example.com)
+      - SERVER_DOMAIN=${SERVER_DOMAIN:-nsl.sh}
+      # Resolution backend API URL
+      - BACKEND_URL=${BACKEND_URL:-http://mesh-router-backend:8192}
       # Cache TTL in seconds
       - CACHE_TTL=${CACHE_TTL:-60}
+    env_file:
+      - path: .env
+        required: false
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/_health"]
@@ -24,9 +42,70 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    depends_on:
+      mesh-router-backend:
+        condition: service_healthy
+        required: false
+
+  # =============================================================================
+  # MESH ROUTER BACKEND (Optional - for full local development)
+  # Domain registration and route resolution API
+  # Uncomment this section for full local stack development
+  # =============================================================================
+  mesh-router-backend:
+    image: mesh-router-backend:local
+    container_name: mesh-router-backend-dev
+    hostname: mesh-router-backend
+    ports:
+      - "8192:8192"
+    networks:
+      - gateway-dev
+    environment:
+      - NODE_ENV=development
+      - REDIS_URL=redis://redis:6379
+      - SERVER_DOMAIN=${SERVER_DOMAIN:-nsl.sh}
+      # Firebase config - mount serviceAccount.json to /app/config/
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/config/serviceAccount.json
+    volumes:
+      # Mount config directory (Firebase service account + CA auto-generation)
+      # Note: Not read-only because CA auto-generates cert/key if missing
+      - ./config:/app/config
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8192/available/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    profiles:
+      - full-stack
+
+  # =============================================================================
+  # REDIS (Optional - required for full local stack)
+  # Route storage for mesh-router-backend
+  # =============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: mesh-router-redis-dev
+    hostname: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - gateway-dev
+    restart: unless-stopped
+    profiles:
+      - full-stack
 
 networks:
-  gateway-ipv6:
+  gateway-dev:
+    driver: bridge
+    name: gateway-dev
+    # Enable IPv6 for testing dual-stack routing
     enable_ipv6: true
     ipam:
       config:

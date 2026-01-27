@@ -1,0 +1,5 @@
+# Environment configuration (contains secrets)
+.env
+
+# Firebase credentials
+config/

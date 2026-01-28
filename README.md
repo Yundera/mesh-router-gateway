@@ -132,6 +132,49 @@ services:
     restart: unless-stopped
 ```
 
+## DNS Resolver Configuration (Important!)
+
+The gateway uses nginx's `resolver` directive to resolve the `BACKEND_URL` hostname. This is configured in `nginx/gateway.conf`.
+
+### Docker Deployments (Default)
+
+```nginx
+resolver 127.0.0.11 valid=30s ipv6=off;
+```
+
+Docker provides an embedded DNS server at `127.0.0.11` that resolves container names to IPs. This is the default and works for all Docker/Docker Compose deployments.
+
+### Non-Docker Deployments
+
+If running outside Docker, change the resolver to your system DNS:
+
+```nginx
+resolver 8.8.8.8 1.1.1.1 valid=30s ipv6=off;
+```
+
+And set `BACKEND_URL` to a publicly resolvable hostname or IP address.
+
+### ⚠️ Common Pitfall: Mixed DNS Servers
+
+**Never mix Docker DNS with public DNS in the resolver:**
+
+```nginx
+# BAD - causes intermittent 502 errors!
+resolver 127.0.0.11 8.8.8.8 1.1.1.1 valid=30s ipv6=off;
+```
+
+Why this fails:
+1. `BACKEND_URL` uses Docker hostname (e.g., `mesh-router-backend-inojob`)
+2. When DNS cache expires, nginx queries configured servers
+3. Public DNS (8.8.8.8) returns NXDOMAIN ("host not found") for Docker hostnames
+4. If public DNS responds before Docker DNS, nginx uses NXDOMAIN → **502 error**
+5. Next request might hit Docker DNS first → works fine
+
+This causes random, hard-to-debug 502 errors that only happen when DNS cache expires.
+
+**Solution**: Use only one DNS source appropriate for your deployment.
+
+
 ## API Contract
 
 ### Resolution Endpoint

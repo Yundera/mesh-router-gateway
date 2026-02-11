@@ -183,27 +183,39 @@ The gateway expects a resolution backend implementing:
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/resolve/:domain` | GET | Get IP/port for a domain |
+| `/resolve/v2/:domain` | GET | Get routes for a domain (v2 API) |
+| `/resolve/:domain` | GET | Get IP/port for a domain (v1 fallback) |
 
-#### Response Schema
+#### Response Schema (v2)
 
 ```json
 {
-  "hostIp": "203.0.113.5",
-  "targetPort": 443,
+  "userId": "abc123",
   "domainName": "alice",
-  "serverDomain": "example.com"
+  "serverDomain": "example.com",
+  "routes": [
+    {"ip": "203.0.113.5", "port": 443, "priority": 1, "source": "agent"},
+    {"ip": "10.77.0.5", "port": 443, "priority": 2, "source": "tunnel"}
+  ],
+  "routesTtl": 580,
+  "lastSeenOnline": "2024-01-15T10:30:00Z"
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `hostIp` | string | Target IP address (direct or tunnel hub) |
-| `targetPort` | number | Target port (default: 443) |
+| `userId` | string | User's Firebase UID |
 | `domainName` | string | Resolved subdomain |
 | `serverDomain` | string | Domain suffix |
+| `routes` | array | Available routes sorted by priority |
+| `routes[].ip` | string | Target IP address (direct or tunnel hub) |
+| `routes[].port` | number | Target port |
+| `routes[].priority` | number | Route priority (lower = higher priority) |
+| `routes[].source` | string | Route source identifier |
+| `routesTtl` | number | Seconds until routes expire |
+| `lastSeenOnline` | string | Last heartbeat timestamp (informational) |
 
-The gateway treats all IPs equally - whether it's a public IP or a tunnel hub IP is transparent to the gateway.
+The gateway selects the highest-priority (lowest number) healthy route. All IPs are treated equally - whether it's a public IP or a tunnel hub IP is transparent to the gateway.
 
 ## Technology Stack
 

@@ -107,6 +107,7 @@ This separation keeps the gateway simple and stateless.
 | `SERVER_DOMAIN` | Domain suffix (e.g., `example.com`) | Required |
 | `BACKEND_URL` | Resolution API URL | `http://localhost:8192` |
 | `CACHE_TTL` | Resolution cache TTL in seconds | `60` |
+| `DEFAULT_BACKEND` | Fallback URL for unclaimed domains (e.g., `http://landing-page:80`) | Empty (returns 404) |
 | `SSL_EMAIL` | Email for Let's Encrypt certificates | Required for SSL |
 | `PORT` | Gateway listen port | `80` |
 | `SSL_PORT` | Gateway SSL listen port | `443` |
@@ -280,7 +281,8 @@ mesh-router-gateway/
 
 | Scenario | Response | Action |
 |----------|----------|--------|
-| Domain not found | 404 Not Found | Log, return error page |
+| Domain not found | Landing page or 404 | If `DEFAULT_BACKEND` set, proxy to landing page; otherwise 404 |
+| No routes registered | Landing page or 404 | If `DEFAULT_BACKEND` set, proxy to landing page; otherwise 404 |
 | Backend API unavailable | 502 Bad Gateway | Retry with backoff, use stale cache |
 | Destination unreachable | 504 Gateway Timeout | Return timeout error |
 | Invalid domain format | 400 Bad Request | Return error with guidance |

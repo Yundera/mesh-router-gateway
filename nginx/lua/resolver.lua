@@ -12,12 +12,18 @@
     4. Select best healthy route by priority
     5. Optional: Perform lazy health check if configured
     6. Cache result and set $backend variable for proxy_pass
+    7. If domain not found/no routes, fall back to config.default (landing page)
 
     Route Selection:
     - Routes sorted by priority (lower = better)
     - If route has healthCheck configured, verify health before using
     - If no healthCheck, assume route is healthy
     - Fallback to first route if all health checks fail
+
+    Default Backend Fallback:
+    - If config.default is set, unclaimed domains route to landing page
+    - Applies to: no subdomain, domain not found, no routes registered
+    - Set DEFAULT_BACKEND env var to enable (e.g., http://landing-page:80)
 ]]
 
 local http = require "resty.http"
@@ -25,6 +31,17 @@ local cjson = require "cjson.safe"
 
 -- Configuration (from environment variables via config.lua)
 local config = dofile("/etc/nginx/lua/config.lua")
+
+-- Helper: Use default backend as fallback
+-- Returns true if fallback was set, false if no default configured
+local function use_default_backend(reason)
+    if config.default and config.default ~= "" then
+        ngx.log(ngx.INFO, "Using default backend for: ", reason)
+        ngx.var.backend = config.default
+        return true
+    end
+    return false
+end
 
 -- Cache key prefixes
 local CACHE_PREFIX_ROUTES = "routes:"
@@ -325,7 +342,10 @@ local function resolve()
     local subdomain = extract_subdomain(host, config.server_domain)
 
     if not subdomain then
-        ngx.log(ngx.WARN, "Could not extract subdomain from host: ", host)
+        ngx.log(ngx.INFO, "No subdomain in host: ", host)
+        if use_default_backend("no subdomain - " .. host) then
+            return
+        end
         ngx.exit(ngx.HTTP_NOT_FOUND)
         return
     end
@@ -351,7 +371,10 @@ local function resolve()
 
     if not data then
         if err == "not_found" then
-            ngx.log(ngx.WARN, "Domain not found: ", subdomain)
+            ngx.log(ngx.INFO, "Domain not found: ", subdomain)
+            if use_default_backend("domain not found - " .. subdomain) then
+                return
+            end
             ngx.exit(ngx.HTTP_NOT_FOUND)
         else
             ngx.log(ngx.ERR, "Resolution failed for ", subdomain, ": ", err)
@@ -363,7 +386,10 @@ local function resolve()
     -- Check if we have routes
     local routes = data.routes
     if not routes or #routes == 0 then
-        ngx.log(ngx.WARN, "No routes registered for: ", subdomain)
+        ngx.log(ngx.INFO, "No routes registered for: ", subdomain)
+        if use_default_backend("no routes - " .. subdomain) then
+            return
+        end
         ngx.exit(ngx.HTTP_NOT_FOUND)
         return
     end

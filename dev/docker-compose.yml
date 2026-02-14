@@ -32,6 +32,9 @@ services:
       - BACKEND_URL=${BACKEND_URL:-http://mesh-router-backend:8192}
       # Cache TTL in seconds
       - CACHE_TTL=${CACHE_TTL:-60}
+      # Default backend for unclaimed domains (landing page)
+      # Leave empty to return 404 for unclaimed domains
+      - DEFAULT_BACKEND=${DEFAULT_BACKEND:-}
     env_file:
       - path: .env
         required: false

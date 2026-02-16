@@ -32,11 +32,21 @@ local cjson = require "cjson.safe"
 -- Configuration (from environment variables via config.lua)
 local config = dofile("/etc/nginx/lua/config.lua")
 
+-- Helper: Generate short request ID for tracing
+local function get_request_id()
+    return string.format("%06x", math.random(0, 0xFFFFFF))
+end
+
+-- Helper: Get elapsed time in ms
+local function elapsed_ms(start_time)
+    return string.format("%.1f", (ngx.now() - start_time) * 1000)
+end
+
 -- Helper: Use default backend as fallback
 -- Returns true if fallback was set, false if no default configured
-local function use_default_backend(reason)
+local function use_default_backend(reason, req_id)
     if config.default and config.default ~= "" then
-        ngx.log(ngx.INFO, "Using default backend for: ", reason)
+        ngx.log(ngx.INFO, "[", req_id or "------", "] using_default_backend reason=", reason, " backend=", config.default)
         ngx.var.backend = config.default
         return true
     end
@@ -50,6 +60,11 @@ local CACHE_PREFIX_HEALTH = "health:"
 -- Health check settings
 local HEALTH_CHECK_TIMEOUT = 2000  -- 2 seconds
 local HEALTH_CACHE_TTL = 300       -- 5 minutes
+
+-- Retry settings for backend queries (handles transient DNS failures)
+-- DNS failures seem to recover within ~110ms based on logs, so use 150ms delay
+local BACKEND_MAX_RETRIES = 3
+local BACKEND_RETRY_DELAY = 0.15  -- 150ms
 
 -- Helper: Get cache instance (accessed at request time, not module load)
 local function get_cache()
@@ -80,7 +95,9 @@ local function extract_subdomain(host, server_domain)
     end
 
     -- Get the rightmost segment (username)
+    -- Supports both dot and dash separators:
     -- "app.alice" -> "alice"
+    -- "app-alice" -> "alice"
     -- "alice" -> "alice"
     local parts = {}
     for part in subdomain:gmatch("[^.]+") do
@@ -91,39 +108,69 @@ local function extract_subdomain(host, server_domain)
         return nil
     end
 
+    -- Get the last dot-separated segment
+    local last_segment = parts[#parts]
+
+    -- If it contains a dash, extract the part after the last dash (username)
+    -- e.g., "filebrowser-painfulurial" -> "painfulurial"
+    local dash_pos = last_segment:match(".*()-")
+    if dash_pos then
+        local username = last_segment:sub(dash_pos + 1)
+        if username ~= "" then
+            return username
+        end
+    end
+
     -- Return the rightmost part (username)
-    return parts[#parts]
+    return last_segment
 end
 
 -- Helper: Query mesh-router-backend for domain resolution (v2 API)
-local function resolve_from_backend_v2(subdomain)
-    local httpc = http.new()
-    httpc:set_timeout(5000)  -- 5 second timeout
-
+local function resolve_from_backend_v2(subdomain, req_id)
+    local start_time = ngx.now()
     local url = config.backend_url .. "/resolve/v2/" .. subdomain
+    ngx.log(ngx.INFO, "[", req_id, "] backend_query_start url=", url)
 
-    local res, err = httpc:request_uri(url, {
-        method = "GET",
-        headers = {
-            ["Content-Type"] = "application/json",
-            ["Accept"] = "application/json",
-        },
-        ssl_verify = true,  -- TODO: Enable in production with proper CA bundle
-    })
+    local res, err
+    for attempt = 1, BACKEND_MAX_RETRIES do
+        local httpc = http.new()
+        httpc:set_timeout(5000)  -- 5 second timeout
+
+        res, err = httpc:request_uri(url, {
+            method = "GET",
+            headers = {
+                ["Content-Type"] = "application/json",
+                ["Accept"] = "application/json",
+            },
+            ssl_verify = true,  -- TODO: Enable in production with proper CA bundle
+        })
+
+        if res then
+            break  -- Success, exit retry loop
+        end
+
+        -- Log retry attempt
+        if attempt < BACKEND_MAX_RETRIES then
+            ngx.log(ngx.WARN, "[", req_id, "] backend_query_retry attempt=", attempt, " err=", err, " elapsed=", elapsed_ms(start_time), "ms")
+            ngx.sleep(BACKEND_RETRY_DELAY)
+        end
+    end
 
     if not res then
-        ngx.log(ngx.ERR, "Failed to query backend: ", err)
+        ngx.log(ngx.ERR, "[", req_id, "] backend_query_failed err=", err, " attempts=", BACKEND_MAX_RETRIES, " elapsed=", elapsed_ms(start_time), "ms")
         return nil, err
     end
 
+    ngx.log(ngx.INFO, "[", req_id, "] backend_query_done status=", res.status, " elapsed=", elapsed_ms(start_time), "ms")
+
     if res.status ~= 200 then
-        ngx.log(ngx.WARN, "Backend returned status ", res.status, " for subdomain: ", subdomain)
+        ngx.log(ngx.WARN, "[", req_id, "] backend_status_error status=", res.status, " subdomain=", subdomain)
         return nil, "not_found"
     end
 
     local data, decode_err = cjson.decode(res.body)
     if not data then
-        ngx.log(ngx.ERR, "Failed to decode backend response: ", decode_err)
+        ngx.log(ngx.ERR, "[", req_id, "] backend_decode_failed err=", decode_err)
         return nil, "invalid_response"
     end
 
@@ -131,24 +178,42 @@ local function resolve_from_backend_v2(subdomain)
 end
 
 -- Helper: Fallback to v1 API for backward compatibility
-local function resolve_from_backend_v1(subdomain)
-    local httpc = http.new()
-    httpc:set_timeout(5000)
-
+local function resolve_from_backend_v1(subdomain, req_id)
+    local start_time = ngx.now()
     local url = config.backend_url .. "/resolve/" .. subdomain
+    ngx.log(ngx.INFO, "[", req_id, "] backend_v1_query_start url=", url)
 
-    local res, err = httpc:request_uri(url, {
-        method = "GET",
-        headers = {
-            ["Content-Type"] = "application/json",
-            ["Accept"] = "application/json",
-        },
-        ssl_verify = true,
-    })
+    local res, err
+    for attempt = 1, BACKEND_MAX_RETRIES do
+        local httpc = http.new()
+        httpc:set_timeout(5000)
+
+        res, err = httpc:request_uri(url, {
+            method = "GET",
+            headers = {
+                ["Content-Type"] = "application/json",
+                ["Accept"] = "application/json",
+            },
+            ssl_verify = true,
+        })
+
+        if res then
+            break  -- Success, exit retry loop
+        end
+
+        -- Log retry attempt
+        if attempt < BACKEND_MAX_RETRIES then
+            ngx.log(ngx.WARN, "[", req_id, "] backend_v1_query_retry attempt=", attempt, " err=", err, " elapsed=", elapsed_ms(start_time), "ms")
+            ngx.sleep(BACKEND_RETRY_DELAY)
+        end
+    end
 
     if not res then
+        ngx.log(ngx.ERR, "[", req_id, "] backend_v1_query_failed err=", err, " attempts=", BACKEND_MAX_RETRIES, " elapsed=", elapsed_ms(start_time), "ms")
         return nil, err
     end
+
+    ngx.log(ngx.INFO, "[", req_id, "] backend_v1_query_done status=", res.status, " elapsed=", elapsed_ms(start_time), "ms")
 
     if res.status ~= 200 then
         return nil, "not_found"
@@ -185,11 +250,9 @@ local function build_backend_url_from_route(route)
         return nil
     end
 
-    -- Determine protocol based on port
-    local protocol = "http"
-    if target_port == 443 then
-        protocol = "https"
-    end
+    -- Use scheme from route if available, default to https
+    -- Gateway always uses HTTPS to connect to hosts (we have certs)
+    local protocol = route.scheme or "https"
 
     -- Handle IPv6 addresses (need brackets)
     local host_part = host_ip
@@ -330,10 +393,14 @@ end
 
 -- Main resolution logic (v2)
 local function resolve()
+    local req_id = get_request_id()
+    local start_time = ngx.now()
     local host = ngx.var.host
 
+    ngx.log(ngx.INFO, "[", req_id, "] resolve_start host=", host or "nil")
+
     if not host then
-        ngx.log(ngx.ERR, "No host header present")
+        ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_host_header")
         ngx.exit(ngx.HTTP_BAD_REQUEST)
         return
     end
@@ -342,8 +409,8 @@ local function resolve()
     local subdomain = extract_subdomain(host, config.server_domain)
 
     if not subdomain then
-        ngx.log(ngx.INFO, "No subdomain in host: ", host)
-        if use_default_backend("no subdomain - " .. host) then
+        ngx.log(ngx.WARN, "[", req_id, "] resolve_error reason=invalid_subdomain host=", host)
+        if use_default_backend("no_subdomain host=" .. host, req_id) then
             return
         end
         ngx.exit(ngx.HTTP_NOT_FOUND)
@@ -356,28 +423,32 @@ local function resolve()
     if cache then
         local cached = cache:get(subdomain)
         if cached then
+            ngx.log(ngx.INFO, "[", req_id, "] cache_hit subdomain=", subdomain, " backend=", cached, " elapsed=", elapsed_ms(start_time), "ms")
             ngx.var.backend = cached
             return
         end
     end
 
+    ngx.log(ngx.INFO, "[", req_id, "] cache_miss subdomain=", subdomain)
+
     -- Query backend (try v2 first, fall back to v1)
-    local data, err = resolve_from_backend_v2(subdomain)
+    local data, err = resolve_from_backend_v2(subdomain, req_id)
 
     if not data then
         -- Try v1 API as fallback
-        data, err = resolve_from_backend_v1(subdomain)
+        ngx.log(ngx.INFO, "[", req_id, "] trying_v1_fallback")
+        data, err = resolve_from_backend_v1(subdomain, req_id)
     end
 
     if not data then
         if err == "not_found" then
-            ngx.log(ngx.INFO, "Domain not found: ", subdomain)
-            if use_default_backend("domain not found - " .. subdomain) then
+            ngx.log(ngx.WARN, "[", req_id, "] resolve_error reason=domain_not_found subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
+            if use_default_backend("domain_not_found subdomain=" .. subdomain, req_id) then
                 return
             end
             ngx.exit(ngx.HTTP_NOT_FOUND)
         else
-            ngx.log(ngx.ERR, "Resolution failed for ", subdomain, ": ", err)
+            ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=backend_failed subdomain=", subdomain, " err=", err, " elapsed=", elapsed_ms(start_time), "ms")
             ngx.exit(ngx.HTTP_BAD_GATEWAY)
         end
         return
@@ -386,13 +457,15 @@ local function resolve()
     -- Check if we have routes
     local routes = data.routes
     if not routes or #routes == 0 then
-        ngx.log(ngx.INFO, "No routes registered for: ", subdomain)
-        if use_default_backend("no routes - " .. subdomain) then
+        ngx.log(ngx.WARN, "[", req_id, "] resolve_error reason=no_routes subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
+        if use_default_backend("no_routes subdomain=" .. subdomain, req_id) then
             return
         end
         ngx.exit(ngx.HTTP_NOT_FOUND)
         return
     end
+
+    ngx.log(ngx.INFO, "[", req_id, "] routes_found count=", #routes)
 
     -- Build user domain for health checks
     local user_domain = (data.domainName or subdomain) .. "." .. (data.serverDomain or config.server_domain)
@@ -401,7 +474,7 @@ local function resolve()
     local selected_route = select_best_route(routes, user_domain, cache)
 
     if not selected_route then
-        ngx.log(ngx.ERR, "No healthy routes for: ", subdomain)
+        ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_healthy_routes subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
         ngx.exit(ngx.HTTP_BAD_GATEWAY)
         return
     end
@@ -410,19 +483,28 @@ local function resolve()
     local backend_url = build_backend_url_from_route(selected_route)
 
     if not backend_url then
-        ngx.log(ngx.ERR, "Could not build backend URL for: ", subdomain)
+        ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=invalid_backend_url subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
         ngx.exit(ngx.HTTP_BAD_GATEWAY)
         return
     end
+
+    ngx.log(ngx.INFO, "[", req_id, "] route_selected ip=", selected_route.ip, " port=", selected_route.port or 443, " priority=", selected_route.priority or "nil", " backend=", backend_url)
 
     -- Cache the result (shorter TTL since routes can change)
     if cache then
         local cache_ttl = config.cache_ttl or 60
         local ok, cache_err = cache:set(subdomain, backend_url, cache_ttl)
         if not ok then
-            ngx.log(ngx.WARN, "Failed to cache resolution: ", cache_err)
+            ngx.log(ngx.WARN, "[", req_id, "] cache_set_failed err=", cache_err)
+        else
+            ngx.log(ngx.INFO, "[", req_id, "] cache_set subdomain=", subdomain, " ttl=", cache_ttl)
         end
     end
+
+    ngx.log(ngx.INFO, "[", req_id, "] resolve_complete subdomain=", subdomain, " backend=", backend_url, " elapsed=", elapsed_ms(start_time), "ms")
+
+    -- Set request ID header for correlation in logs
+    ngx.req.set_header("X-Request-ID", req_id)
 
     -- Set backend variable for proxy_pass
     ngx.var.backend = backend_url

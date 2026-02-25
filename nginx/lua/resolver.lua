@@ -395,9 +395,10 @@ end
 local function resolve()
     local req_id = get_request_id()
     local start_time = ngx.now()
-    local host = ngx.var.host
+    -- Check X-Forwarded-Host first (set by CF Worker), fall back to Host header
+    local host = ngx.var.http_x_forwarded_host or ngx.var.host
 
-    ngx.log(ngx.INFO, "[", req_id, "] resolve_start host=", host or "nil")
+    ngx.log(ngx.INFO, "[", req_id, "] resolve_start host=", host or "nil", " x_forwarded_host=", ngx.var.http_x_forwarded_host or "nil")
 
     if not host then
         ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_host_header")

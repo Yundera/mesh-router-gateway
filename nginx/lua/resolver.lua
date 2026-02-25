@@ -406,6 +406,9 @@ local function resolve()
         return
     end
 
+    -- Set proxy_host for nginx to use in proxy_set_header Host
+    ngx.var.proxy_host = host
+
     -- Extract subdomain (username)
     local subdomain = extract_subdomain(host, config.server_domain)
 

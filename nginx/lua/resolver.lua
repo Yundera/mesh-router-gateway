@@ -348,19 +348,61 @@ local function check_route_health(route, user_domain)
     return healthy
 end
 
+-- Helper: Filter routes by scheme (http or https)
+-- Returns routes matching the requested scheme, or all routes if no match found
+local function filter_routes_by_scheme(routes, required_scheme)
+    if not routes or #routes == 0 then
+        return routes
+    end
+
+    -- If no scheme required, return all routes
+    if not required_scheme or required_scheme == "" then
+        return routes
+    end
+
+    -- Filter routes by scheme
+    local filtered = {}
+    for _, route in ipairs(routes) do
+        -- Route scheme defaults to "https" for backward compatibility
+        local route_scheme = route.scheme or "https"
+        if route_scheme == required_scheme then
+            table.insert(filtered, route)
+        end
+    end
+
+    -- If no routes match the scheme, fall back to all routes
+    -- This maintains backward compatibility with routes that don't have scheme set
+    if #filtered == 0 then
+        ngx.log(ngx.INFO, "no_routes_for_scheme scheme=", required_scheme, " falling_back_to_all count=", #routes)
+        return routes
+    end
+
+    return filtered
+end
+
 -- Helper: Select best healthy route
+-- Filters by scheme first (from X-Forwarded-Proto), then by priority
 local function select_best_route(routes, user_domain, cache)
     if not routes or #routes == 0 then
         return nil
     end
 
+    -- Get required scheme from X-Forwarded-Proto header
+    local required_scheme = ngx.var.http_x_forwarded_proto
+    if required_scheme then
+        required_scheme = required_scheme:lower()
+    end
+
+    -- Filter routes by scheme first
+    local scheme_filtered_routes = filter_routes_by_scheme(routes, required_scheme)
+
     -- Sort routes by priority (lower = better)
-    table.sort(routes, function(a, b)
+    table.sort(scheme_filtered_routes, function(a, b)
         return (a.priority or 999) < (b.priority or 999)
     end)
 
     -- Find first healthy route
-    for _, route in ipairs(routes) do
+    for _, route in ipairs(scheme_filtered_routes) do
         -- No health check = assume healthy
         if not route.healthCheck or not route.healthCheck.path then
             return route
@@ -388,7 +430,7 @@ local function select_best_route(routes, user_domain, cache)
 
     -- All routes with health checks failed, return first route as fallback
     ngx.log(ngx.WARN, "All routes unhealthy, using first route as fallback")
-    return routes[1]
+    return scheme_filtered_routes[1]
 end
 
 -- Main resolution logic (v2)
@@ -399,7 +441,7 @@ local function resolve()
     -- Then X-Forwarded-Host (set by CF Worker), then fall back to Host header
     local host = ngx.var.http_x_original_host or ngx.var.http_x_forwarded_host or ngx.var.host
 
-    ngx.log(ngx.INFO, "[", req_id, "] resolve_start host=", host or "nil", " x_original_host=", ngx.var.http_x_original_host or "nil", " x_forwarded_host=", ngx.var.http_x_forwarded_host or "nil")
+    ngx.log(ngx.INFO, "[", req_id, "] resolve_start host=", host or "nil", " x_original_host=", ngx.var.http_x_original_host or "nil", " x_forwarded_host=", ngx.var.http_x_forwarded_host or "nil", " x_forwarded_proto=", ngx.var.http_x_forwarded_proto or "nil")
 
     if not host then
         ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_host_header")
@@ -493,7 +535,7 @@ local function resolve()
         return
     end
 
-    ngx.log(ngx.INFO, "[", req_id, "] route_selected ip=", selected_route.ip, " port=", selected_route.port or 443, " priority=", selected_route.priority or "nil", " backend=", backend_url)
+    ngx.log(ngx.INFO, "[", req_id, "] route_selected ip=", selected_route.ip, " port=", selected_route.port or 443, " scheme=", selected_route.scheme or "https", " priority=", selected_route.priority or "nil", " backend=", backend_url)
 
     -- Cache the result (shorter TTL since routes can change)
     if cache then

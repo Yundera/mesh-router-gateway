@@ -251,13 +251,14 @@ local function build_backend_url_from_route(route)
     end
 
     -- Use scheme from route if available, default to https
-    -- Gateway always uses HTTPS to connect to hosts (we have certs)
     local protocol = route.scheme or "https"
 
-    -- Handle IPv6 addresses (need brackets)
-    local host_part = host_ip
+    -- Build host part with brackets for IPv6
+    local host_part
     if host_ip:find(":") then
         host_part = "[" .. host_ip .. "]"
+    else
+        host_part = host_ip
     end
 
     return protocol .. "://" .. host_part .. ":" .. target_port
@@ -535,7 +536,14 @@ local function resolve()
         return
     end
 
-    ngx.log(ngx.INFO, "[", req_id, "] route_selected ip=", selected_route.ip, " port=", selected_route.port or 443, " scheme=", selected_route.scheme or "https", " priority=", selected_route.priority or "nil", " backend=", backend_url)
+    -- Set SSL name for SNI (original hostname for cert matching)
+    -- This allows TLS to work with raw IP in URL but correct SNI header
+    local protocol = selected_route.scheme or "https"
+    if protocol == "https" then
+        ngx.var.proxy_ssl_name = host
+    end
+
+    ngx.log(ngx.INFO, "[", req_id, "] route_selected ip=", selected_route.ip, " port=", selected_route.port or 443, " scheme=", protocol, " priority=", selected_route.priority or "nil", " backend=", backend_url)
 
     -- Cache the result (shorter TTL since routes can change)
     if cache then

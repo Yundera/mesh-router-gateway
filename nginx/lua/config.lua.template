@@ -22,4 +22,12 @@ config.override = {}
 -- Default backend (used as fallback)
 config.default = "${DEFAULT_BACKEND}"
 
+-- Failover configuration
+config.failover_max_retries = 3           -- Max routes to try before giving up
+config.passive_unhealthy_ttl = 120        -- Seconds to mark route unhealthy after failure
+config.passive_failure_threshold = 2      -- Failures before marking unhealthy
+config.proxy_connect_timeout = 5000       -- Connection timeout in ms
+config.proxy_read_timeout = 60000         -- Read timeout in ms
+config.proxy_send_timeout = 60000         -- Send timeout in ms
+
 return config

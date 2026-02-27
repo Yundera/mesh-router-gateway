@@ -43,26 +43,34 @@ You can benchmark at different layers to isolate latency:
 
 | Test Point | URL Pattern | What It Tests |
 |------------|-------------|---------------|
-| **A. Full Stack** | `https://app-subdomain.server.nsl.sh/` | End-to-end: Gateway + routing + Caddy + container |
-| **B. Caddy Direct** | `https://[pcs-ipv6]:10443/` with Host header | Caddy + TLS + container (bypasses gateway) |
-| **C. Container Direct** | `http://[pcs-ipv6]:80/` | Container only (no proxy, no TLS) |
-| **D. Gateway Root** | `https://nsl.sh/` | Gateway base latency (no routing) |
+| **A. CF Worker → nip.io** | `https://app-user.domain.com/` | CF Worker + nip.io direct to PCS (fastest) |
+| **B. CF Worker → Gateway** | Same URL + `X-Mesh-Force: gateway` | CF Worker + OpenResty gateway + PCS |
+| **C. Gateway Direct** | Gateway IP + `Host` header | OpenResty gateway only (bypasses CF Worker) |
+| **D. Caddy Direct** | `https://[pcs-ipv6]:10443/` + Host header | Caddy + TLS + container (bypasses gateway) |
+| **E. Container Direct** | `http://[pcs-ipv6]:80/` | Container only (no proxy, no TLS) |
 
 ### Example Test Endpoints
 
 ```bash
-# A. Full stack (through gateway)
-https://nginx-holyhorse.nsl.sh/
+# A. CF Worker → nip.io (default, fastest path)
+curl -H "X-Mesh-Trace: 1" https://admin-wisera.inojob.com/
+# Response: x-mesh-route: cf-worker,nip.io,direct,pcs
 
-# B. Caddy direct (HTTPS, requires Host header)
-https://[2001:bc8:3021:201:be24:11ff:fef0:41b4]:10443/
-# With: -H "Host: nginx-holyhorse.nsl.sh"
+# B. CF Worker → Gateway (force gateway fallback)
+curl -H "X-Mesh-Trace: 1" -H "X-Mesh-Force: gateway" https://admin-wisera.inojob.com/
+# Response: x-mesh-route: cf-worker,gateway-fallback,pcs
 
-# C. Container direct (HTTP, no TLS)
-http://[2001:bc8:3021:201:be24:11ff:fef0:41b4]/
+# C. Gateway direct (from staging server, bypasses CF Worker)
+curl -H "X-Mesh-Trace: 1" -H "X-Mesh-Force: direct" \
+     -H "Host: admin-wisera.inojob.com" http://172.30.0.2:80/
+# Response: x-mesh-route: agent,pcs
 
-# D. Gateway root
-https://nsl.sh/
+# D. Caddy direct (HTTPS, requires Host header)
+curl -k -H "Host: nginx-holyhorse.nsl.sh" \
+     https://[2001:bc8:3021:201:be24:11ff:fef0:41b4]:10443/
+
+# E. Container direct (HTTP, no TLS)
+curl http://[2001:bc8:3021:201:be24:11ff:fef0:41b4]/
 ```
 
 ## Benchmarking Tools
@@ -165,6 +173,36 @@ Measured from external client to Scaleway Paris PCS:
 | Caddy direct (HTTPS) | ~475 | ~97ms | ~200ms |
 | Full stack (Gateway) | ~42 | ~162ms | ~354ms |
 
+### Routing Path Benchmarks
+
+Measured with `hey -n 100 -c 10` to inojob.com staging (Feb 2026):
+
+| Route Path | Avg Latency | Req/sec | X-Mesh-Route |
+|------------|-------------|---------|--------------|
+| CF Worker → nip.io → PCS | **~42ms** | 185 | `cf-worker,nip.io,direct,pcs` |
+| CF Worker → Gateway → PCS | ~182ms | 52 | `cf-worker,gateway-fallback,pcs` |
+| Gateway → agent (direct) | ~445ms | 21 | `agent,pcs` |
+
+**Key findings:**
+- **nip.io direct path is ~4x faster** than gateway fallback (42ms vs 182ms)
+- Gateway adds significant latency when accessed from staging server (~445ms)
+- The nip.io path bypasses OpenResty entirely, going directly to PCS via Cloudflare
+
+**Benchmark commands:**
+
+```bash
+# 1. CF Worker default path (nip.io direct)
+hey -n 100 -c 10 -H "X-Mesh-Trace: 1" "https://admin-wisera.inojob.com/"
+
+# 2. CF Worker with forced gateway fallback
+hey -n 100 -c 10 -H "X-Mesh-Trace: 1" -H "X-Mesh-Force: gateway" "https://admin-wisera.inojob.com/"
+
+# 3. Gateway direct (from staging server)
+hey -n 100 -c 10 -H "X-Mesh-Trace: 1" -H "X-Mesh-Force: direct" \
+    -H "X-Forwarded-Proto: http" -H "Host: admin-wisera.inojob.com" \
+    "http://172.30.0.2:80/"
+```
+
 ## Troubleshooting
 
 ### Cache Hit vs Miss
@@ -179,11 +217,44 @@ for i in 1 2 3 4 5; do
 done
 ```
 
-### Check Active Route
+### Check Active Route with Trace Headers
 
-To see if traffic goes through tunnel or direct:
-- Check mesh-router-backend logs
-- Look at `X-Route-Source` header if exposed
+Use the `X-Mesh-Trace` header to see the exact routing path taken:
+
+```bash
+# Add X-Mesh-Trace header to see route path in response
+curl -s -D- -o /dev/null -H "X-Mesh-Trace: 1" https://admin-wisera.inojob.com/ | grep x-mesh-route
+# Output: x-mesh-route: cf-worker,nip.io,direct,pcs
+```
+
+The `X-Mesh-Route` response header shows the path taken:
+- `cf-worker` - Request went through Cloudflare Worker
+- `nip.io` - Used nip.io direct routing (not gateway fallback)
+- `gateway-fallback` - Used OpenResty gateway (when nip.io fails or forced)
+- `direct` / `agent` - Route was from mesh-router-agent (direct IP)
+- `tunnel` - Route was from mesh-router-tunnel (WireGuard)
+- `pcs` - Final destination is Personal Cloud Server
+
+### Force Specific Routes
+
+Use `X-Mesh-Force` header to force a specific routing path for testing:
+
+```bash
+# Force gateway fallback (bypass nip.io direct path)
+curl -H "X-Mesh-Force: gateway" https://admin-wisera.inojob.com/
+
+# Force direct (agent) route in gateway
+curl -H "X-Mesh-Force: direct" -H "Host: admin-wisera.inojob.com" https://gateway.entrypoint.inojob.com/
+
+# Force tunnel route in gateway
+curl -H "X-Mesh-Force: tunnel" -H "Host: admin-wisera.inojob.com" https://gateway.entrypoint.inojob.com/
+```
+
+| X-Mesh-Force Value | Effect |
+|--------------------|--------|
+| `gateway` | CF Worker skips nip.io, uses gateway fallback |
+| `direct` | OpenResty gateway prefers route with source="agent" |
+| `tunnel` | OpenResty gateway prefers route with source="tunnel" |
 
 ### Common Issues
 

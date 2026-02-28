@@ -412,14 +412,10 @@ local function prepare_routes_for_failover(routes, user_domain, cache, req_id)
     -- Check for force routing header
     local force_mode = ngx.var.http_x_mesh_force or ""
 
-    -- Get required scheme from X-Forwarded-Proto header
-    local required_scheme = ngx.var.http_x_forwarded_proto
-    if required_scheme then
-        required_scheme = required_scheme:lower()
-    end
-
-    -- Filter routes by scheme first
-    local scheme_filtered_routes = filter_routes_by_scheme(routes, required_scheme)
+    -- Skip scheme filtering - let priority and failover handle route selection
+    -- Tunnel routes always use HTTP internally regardless of client scheme
+    -- The build_backend_url_from_route function handles protocol selection per route type
+    local scheme_filtered_routes = routes
 
     if #scheme_filtered_routes == 0 then
         return routes
@@ -496,11 +492,12 @@ local function resolve()
     -- Store request ID in context for content_handler
     ngx.ctx.req_id = req_id
 
-    -- Check X-Original-Host first (CF proxy overwrites X-Forwarded-Host, but not this one)
-    -- Then X-Forwarded-Host (set by CF Worker), then fall back to Host header
-    local host = ngx.var.http_x_original_host or ngx.var.http_x_forwarded_host or ngx.var.host
+    -- Host extraction modes:
+    -- - X-Mesh-Route-Host present: CF Worker fallback mode → use it for routing
+    -- - X-Mesh-Route-Host absent: Direct mode → use Host header
+    local host = ngx.var.http_x_mesh_route_host or ngx.var.host
 
-    ngx.log(ngx.INFO, "[", req_id, "] resolve_start host=", host or "nil", " x_original_host=", ngx.var.http_x_original_host or "nil", " x_forwarded_host=", ngx.var.http_x_forwarded_host or "nil", " x_forwarded_proto=", ngx.var.http_x_forwarded_proto or "nil")
+    ngx.log(ngx.INFO, "[", req_id, "] resolve_start host=", host or "nil", " x_mesh_route_host=", ngx.var.http_x_mesh_route_host or "nil")
 
     if not host then
         ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_host_header")

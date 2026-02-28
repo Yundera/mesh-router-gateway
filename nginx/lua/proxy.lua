@@ -197,9 +197,8 @@ local function proxy_to_route(route, request, req_id)
     headers["X-Request-ID"] = req_id
 
     -- SSL options for HTTPS backends
-    -- TODO: Re-enable ssl_verify once PCS uses mesh-router CA certificates
-    -- Currently PCS uses CloudFlare Origin CA which isn't in our trusted certs
-    local ssl_verify = false
+    -- Verify SSL certificates using mesh-router CA (configured in nginx.conf lua_ssl_trusted_certificate)
+    local ssl_verify = true
     local ssl_server_name = nil
     if protocol == "https" then
         ssl_server_name = request.host  -- SNI for cert matching

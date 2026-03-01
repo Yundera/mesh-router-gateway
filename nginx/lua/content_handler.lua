@@ -68,6 +68,9 @@ local function proxy_to_default(backend_url, request, req_id)
     for k, v in pairs(request.headers) do
         headers[k] = v
     end
+    -- ngx.req.get_headers() returns lowercase keys, so we need to remove "host"
+    -- before setting "Host" to avoid duplicate headers (Lua tables are case-sensitive)
+    headers["host"] = nil
     headers["Host"] = request.proxy_host or request.host
     headers["X-Real-IP"] = ngx.var.remote_addr
     headers["X-Forwarded-For"] = ngx.var.proxy_add_x_forwarded_for or ngx.var.remote_addr

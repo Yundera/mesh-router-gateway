@@ -95,6 +95,9 @@ local function proxy_to_route(route, request, req_id)
     end
 
     -- Set correct Host header
+    -- ngx.req.get_headers() returns lowercase keys, so we need to remove "host"
+    -- before setting "Host" to avoid duplicate headers (Lua tables are case-sensitive)
+    headers["host"] = nil
     headers["Host"] = request.proxy_host or request.host
 
     -- Add forwarding headers

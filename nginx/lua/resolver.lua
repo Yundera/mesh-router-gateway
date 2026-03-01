@@ -36,6 +36,10 @@ end
 
 -- Helper: Check if request is a WebSocket upgrade
 local function is_websocket_request()
+    -- Check custom header from CF Worker (CF doesn't forward Upgrade header)
+    if ngx.var.http_x_mesh_websocket == "1" then
+        return true
+    end
     local upgrade = ngx.var.http_upgrade
     if not upgrade then
         return false
@@ -496,6 +500,16 @@ local function resolve()
 
         -- Set nginx variables for proxy_pass
         ngx.var.backend = backend_url
+
+        -- Set proxy host for downstream routing (Caddy needs original Host header)
+        -- CF Worker mode: use X-Mesh-Route-Host header
+        -- Direct mode: use original Host header
+        ngx.var.proxy_host = ngx.var.http_x_mesh_route_host or host
+
+        -- Set WebSocket upgrade header
+        -- CF Worker sends X-Mesh-WebSocket but not the actual Upgrade header
+        -- Direct mode: use original Upgrade header
+        ngx.var.ws_upgrade = ngx.var.http_upgrade or "websocket"
 
         -- Set SSL name for SNI
         local protocol = best_route.scheme or "https"

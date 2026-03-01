@@ -34,6 +34,12 @@ local RETRIABLE_ERRORS = {
     ["certificate verify failed"] = true,
     ["ssl handshake failed"] = true,
     ["bad ssl client hello"] = true,
+    -- Additional SSL certificate chain errors (from OpenSSL)
+    ["unable to get local issuer certificate"] = true,
+    ["unable to get issuer certificate"] = true,
+    ["self signed certificate"] = true,
+    ["certificate has expired"] = true,
+    ["unable to verify the first certificate"] = true,
 }
 
 -- Check if an error should trigger failover
@@ -192,7 +198,7 @@ local function proxy_to_route(route, request, req_id)
     -- Add forwarding headers
     headers["X-Real-IP"] = ngx.var.remote_addr
     headers["X-Forwarded-For"] = ngx.var.proxy_add_x_forwarded_for or ngx.var.remote_addr
-    headers["X-Forwarded-Proto"] = ngx.var.scheme
+    headers["X-Forwarded-Proto"] = ngx.var.http_x_forwarded_proto or ngx.var.scheme
     headers["X-Forwarded-Host"] = request.host
     headers["X-Request-ID"] = req_id
 

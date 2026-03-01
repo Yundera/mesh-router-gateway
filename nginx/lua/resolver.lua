@@ -527,6 +527,7 @@ local function resolve()
     local cache = get_cache()
 
     -- Check cache for routes data (JSON string)
+    local sorted_routes = nil
     local cached_routes_json = nil
     if cache then
         cached_routes_json = cache:get("routes:" .. subdomain)
@@ -535,86 +536,87 @@ local function resolve()
             if cached_routes and #cached_routes > 0 then
                 ngx.log(ngx.INFO, "[", req_id, "] cache_hit subdomain=", subdomain, " routes_count=", #cached_routes, " elapsed=", elapsed_ms(start_time), "ms")
                 -- Prepare routes with passive health filtering
-                local sorted_routes = prepare_routes_for_failover(cached_routes, host, cache, req_id)
-                ngx.ctx.routes = sorted_routes
-                ngx.req.set_header("X-Request-ID", req_id)
-                return
+                sorted_routes = prepare_routes_for_failover(cached_routes, host, cache, req_id)
+                -- Continue to WebSocket check below (don't return early)
             end
         end
     end
 
-    ngx.log(ngx.INFO, "[", req_id, "] cache_miss subdomain=", subdomain)
+    -- Only fetch from backend if no cache hit
+    if not sorted_routes then
+        ngx.log(ngx.INFO, "[", req_id, "] cache_miss subdomain=", subdomain)
 
-    -- Query backend (try v2 first, fall back to v1)
-    local data, err = resolve_from_backend_v2(subdomain, req_id)
+        -- Query backend (try v2 first, fall back to v1)
+        local data, err = resolve_from_backend_v2(subdomain, req_id)
 
-    if not data then
-        -- Try v1 API as fallback
-        ngx.log(ngx.INFO, "[", req_id, "] trying_v1_fallback")
-        data, err = resolve_from_backend_v1(subdomain, req_id)
-    end
+        if not data then
+            -- Try v1 API as fallback
+            ngx.log(ngx.INFO, "[", req_id, "] trying_v1_fallback")
+            data, err = resolve_from_backend_v1(subdomain, req_id)
+        end
 
-    if not data then
-        if err == "not_found" then
-            ngx.log(ngx.WARN, "[", req_id, "] resolve_error reason=domain_not_found subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
-            if use_default_backend("domain_not_found subdomain=" .. subdomain, req_id) then
+        if not data then
+            if err == "not_found" then
+                ngx.log(ngx.WARN, "[", req_id, "] resolve_error reason=domain_not_found subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
+                if use_default_backend("domain_not_found subdomain=" .. subdomain, req_id) then
+                    return
+                end
+                ngx.exit(ngx.HTTP_NOT_FOUND)
+            else
+                ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=backend_failed subdomain=", subdomain, " err=", err, " elapsed=", elapsed_ms(start_time), "ms")
+                ngx.exit(ngx.HTTP_BAD_GATEWAY)
+            end
+            return
+        end
+
+        -- Check if we have routes
+        local routes = data.routes
+        if not routes or #routes == 0 then
+            ngx.log(ngx.WARN, "[", req_id, "] resolve_error reason=no_routes subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
+            if use_default_backend("no_routes subdomain=" .. subdomain, req_id) then
                 return
             end
             ngx.exit(ngx.HTTP_NOT_FOUND)
-        else
-            ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=backend_failed subdomain=", subdomain, " err=", err, " elapsed=", elapsed_ms(start_time), "ms")
-            ngx.exit(ngx.HTTP_BAD_GATEWAY)
-        end
-        return
-    end
-
-    -- Check if we have routes
-    local routes = data.routes
-    if not routes or #routes == 0 then
-        ngx.log(ngx.WARN, "[", req_id, "] resolve_error reason=no_routes subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
-        if use_default_backend("no_routes subdomain=" .. subdomain, req_id) then
             return
         end
-        ngx.exit(ngx.HTTP_NOT_FOUND)
-        return
-    end
 
-    ngx.log(ngx.INFO, "[", req_id, "] routes_found count=", #routes)
+        ngx.log(ngx.INFO, "[", req_id, "] routes_found count=", #routes)
 
-    -- Build user domain for health checks
-    local user_domain = (data.domainName or subdomain) .. "." .. (data.serverDomain or config.server_domain)
+        -- Build user domain for health checks
+        local user_domain = (data.domainName or subdomain) .. "." .. (data.serverDomain or config.server_domain)
 
-    -- Prepare routes for failover (sorted by passive health and priority)
-    local sorted_routes = prepare_routes_for_failover(routes, user_domain, cache, req_id)
+        -- Prepare routes for failover (sorted by passive health and priority)
+        sorted_routes = prepare_routes_for_failover(routes, user_domain, cache, req_id)
 
-    if not sorted_routes or #sorted_routes == 0 then
-        ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_healthy_routes subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
-        ngx.exit(ngx.HTTP_BAD_GATEWAY)
-        return
-    end
-
-    -- Log first (primary) route for debugging
-    local primary_route = sorted_routes[1]
-    local protocol = primary_route.scheme or "https"
-    if primary_route.source == "tunnel" then
-        protocol = "http"
-    end
-
-    ngx.log(ngx.INFO, "[", req_id, "] primary_route ip=", primary_route.ip, " port=", primary_route.port or 443,
-        " scheme=", protocol, " source=", primary_route.source or "unknown",
-        " priority=", primary_route.priority or "nil", " total_routes=", #sorted_routes)
-
-    -- Cache routes for future requests (cache raw routes, not sorted)
-    if cache then
-        local cache_ttl = config.cache_ttl or 60
-        local routes_json = cjson.encode(routes)
-        local ok, cache_err = cache:set("routes:" .. subdomain, routes_json, cache_ttl)
-        if not ok then
-            ngx.log(ngx.WARN, "[", req_id, "] cache_set_failed err=", cache_err)
-        else
-            ngx.log(ngx.INFO, "[", req_id, "] cache_set subdomain=", subdomain, " ttl=", cache_ttl)
+        if not sorted_routes or #sorted_routes == 0 then
+            ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_healthy_routes subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
+            ngx.exit(ngx.HTTP_BAD_GATEWAY)
+            return
         end
-    end
+
+        -- Log first (primary) route for debugging
+        local primary_route = sorted_routes[1]
+        local protocol = primary_route.scheme or "https"
+        if primary_route.source == "tunnel" then
+            protocol = "http"
+        end
+
+        ngx.log(ngx.INFO, "[", req_id, "] primary_route ip=", primary_route.ip, " port=", primary_route.port or 443,
+            " scheme=", protocol, " source=", primary_route.source or "unknown",
+            " priority=", primary_route.priority or "nil", " total_routes=", #sorted_routes)
+
+        -- Cache routes for future requests (cache raw routes, not sorted)
+        if cache then
+            local cache_ttl = config.cache_ttl or 60
+            local routes_json = cjson.encode(routes)
+            local ok, cache_err = cache:set("routes:" .. subdomain, routes_json, cache_ttl)
+            if not ok then
+                ngx.log(ngx.WARN, "[", req_id, "] cache_set_failed err=", cache_err)
+            else
+                ngx.log(ngx.INFO, "[", req_id, "] cache_set subdomain=", subdomain, " ttl=", cache_ttl)
+            end
+        end
+    end  -- end if not sorted_routes
 
     ngx.log(ngx.INFO, "[", req_id, "] resolve_complete subdomain=", subdomain, " routes=", #sorted_routes, " elapsed=", elapsed_ms(start_time), "ms")
 

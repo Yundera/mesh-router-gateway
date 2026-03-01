@@ -71,7 +71,7 @@ local function proxy_to_default(backend_url, request, req_id)
     headers["Host"] = request.proxy_host or request.host
     headers["X-Real-IP"] = ngx.var.remote_addr
     headers["X-Forwarded-For"] = ngx.var.proxy_add_x_forwarded_for or ngx.var.remote_addr
-    headers["X-Forwarded-Proto"] = ngx.var.scheme
+    headers["X-Forwarded-Proto"] = ngx.var.http_x_forwarded_proto or ngx.var.scheme
     headers["X-Forwarded-Host"] = request.host
     headers["X-Request-ID"] = req_id
 

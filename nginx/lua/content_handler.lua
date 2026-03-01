@@ -2,14 +2,14 @@
     content_handler.lua - Content phase handler for mesh-router-gateway
 
     This module handles the content phase of request processing. It receives
-    resolved routes from the access phase (resolver.lua) and proxies the
-    request with automatic failover between routes.
+    the selected route from the access phase (resolver.lua) and proxies the
+    request to the backend.
 
     Flow:
-    1. Retrieve routes and request context from ngx.ctx (set by resolver.lua)
-    2. If use_default flag set, proxy to default backend (no failover)
-    3. Otherwise, proxy with failover through sorted routes
-    4. On complete failure, return 502 Bad Gateway
+    1. Retrieve route and request context from ngx.ctx (set by resolver.lua)
+    2. If use_default flag set, proxy to default backend
+    3. Otherwise, proxy to the selected route
+    4. On failure, return 502 Bad Gateway
 ]]
 
 local http = require "resty.http"
@@ -153,35 +153,35 @@ local function handle()
         return ngx.exit(502)
     end
 
-    -- Get routes from context
-    local routes = ctx.routes
-    if not routes or #routes == 0 then
-        ngx.log(ngx.ERR, "[", req_id, "] content_handler no_routes_in_context")
+    -- Get route from context (single best route selected by resolver)
+    local route = ctx.route
+    if not route then
+        ngx.log(ngx.ERR, "[", req_id, "] content_handler no_route_in_context")
         ngx.status = 502
         ngx.header["Content-Type"] = "application/json"
-        ngx.say('{"error":"No routes available","code":"NO_ROUTES"}')
+        ngx.say('{"error":"No route available","code":"NO_ROUTE"}')
         return ngx.exit(502)
     end
 
-    ngx.log(ngx.INFO, "[", req_id, "] content_handler start routes_count=", #routes)
+    ngx.log(ngx.INFO, "[", req_id, "] content_handler start route=", route.ip, ":", route.port)
 
     -- Check if tracing is enabled
     local trace_enabled = ngx.var.http_x_mesh_trace ~= nil
 
-    -- Proxy with failover
-    local success, err = proxy.proxy_with_failover(routes, request, req_id, trace_enabled)
+    -- Proxy to single route (no failover)
+    local success, err = proxy.proxy(route, request, req_id, trace_enabled)
 
     if success then
         ngx.log(ngx.INFO, "[", req_id, "] content_handler complete elapsed=", elapsed_ms(start_time), "ms")
         return ngx.exit(ngx.OK)
     end
 
-    -- All routes failed
-    ngx.log(ngx.ERR, "[", req_id, "] content_handler all_routes_failed elapsed=", elapsed_ms(start_time), "ms err=", err or "unknown")
+    -- Route failed
+    ngx.log(ngx.ERR, "[", req_id, "] content_handler route_failed elapsed=", elapsed_ms(start_time), "ms err=", err or "unknown")
 
     ngx.status = 502
     ngx.header["Content-Type"] = "application/json"
-    ngx.say('{"error":"All backend routes failed","code":"ROUTES_EXHAUSTED"}')
+    ngx.say('{"error":"Backend route failed","code":"ROUTE_FAILED"}')
     return ngx.exit(502)
 end
 

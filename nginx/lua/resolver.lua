@@ -2,22 +2,20 @@
     resolver.lua - Domain resolution for mesh-router-gateway (v2)
 
     Resolves incoming domain requests to backend IP:port by querying
-    the mesh-router-backend API. Supports multiple routes with priority,
-    passive health checking, and automatic failover.
+    the mesh-router-backend API. Supports route selection by priority.
 
     Flow:
     1. Extract subdomain from Host header
     2. Check local cache for routes
     3. If cache miss, query mesh-router-backend /resolve/v2/:domain
-    4. Sort routes by passive health status and priority
-    5. Store routes in ngx.ctx for content_handler.lua to use with failover
+    4. Select best route by priority
+    5. Store route in ngx.ctx for content_handler.lua to use
     6. If domain not found/no routes, fall back to config.default (landing page)
 
-    Route Selection (with failover support):
+    Route Selection:
     - Routes sorted by priority (lower = better)
-    - Passively unhealthy routes are deprioritized but kept as fallback
-    - Content handler (content_handler.lua) tries routes in order with failover
-    - Failed routes are marked unhealthy for future requests (passive health)
+    - Best route selected and passed to content_handler
+    - No failover - routes are validated at registration time (backend)
 
     Default Backend Fallback:
     - If config.default is set, unclaimed domains route to landing page
@@ -27,7 +25,6 @@
 
 local http = require "resty.http"
 local cjson = require "cjson.safe"
-local proxy = require "proxy"
 
 -- Configuration (from environment variables via config.lua)
 local config = dofile("/etc/nginx/lua/config.lua")
@@ -65,13 +62,8 @@ local function use_default_backend(reason, req_id)
     return false
 end
 
--- Cache key prefixes
+-- Cache key prefix
 local CACHE_PREFIX_ROUTES = "routes:"
-local CACHE_PREFIX_HEALTH = "health:"
-
--- Health check settings
-local HEALTH_CHECK_TIMEOUT = 2000  -- 2 seconds
-local HEALTH_CACHE_TTL = 300       -- 5 minutes
 
 -- Retry settings for backend queries (handles transient DNS failures)
 -- DNS failures seem to recover within ~110ms based on logs, so use 150ms delay
@@ -283,91 +275,6 @@ local function build_backend_url_from_route(route)
     return protocol .. "://" .. host_part .. ":" .. target_port
 end
 
--- Helper: Generate cache key for route health
-local function get_health_cache_key(route)
-    return CACHE_PREFIX_HEALTH .. route.ip .. ":" .. (route.port or 443)
-end
-
--- Helper: Check if route health is cached and healthy
-local function get_cached_health(cache, route)
-    if not cache then
-        return nil
-    end
-
-    local key = get_health_cache_key(route)
-    local cached = cache:get(key)
-
-    if cached then
-        local health = cjson.decode(cached)
-        return health
-    end
-
-    return nil
-end
-
--- Helper: Cache health status for a route
-local function cache_health(cache, route, healthy)
-    if not cache then
-        return
-    end
-
-    local key = get_health_cache_key(route)
-    local health = {
-        healthy = healthy,
-        checkedAt = ngx.now()
-    }
-
-    local ok, err = cache:set(key, cjson.encode(health), HEALTH_CACHE_TTL)
-    if not ok then
-        ngx.log(ngx.WARN, "Failed to cache health: ", err)
-    end
-end
-
--- Helper: Perform health check for a route (if configured)
-local function check_route_health(route, user_domain)
-    -- No health check configured = assume healthy
-    if not route.healthCheck or not route.healthCheck.path then
-        return true
-    end
-
-    local hc = route.healthCheck
-    local host_header = hc.host or user_domain
-
-    local httpc = http.new()
-    httpc:set_timeout(HEALTH_CHECK_TIMEOUT)
-
-    -- Build health check URL
-    local target_port = route.port or 443
-    local protocol = target_port == 443 and "https" or "http"
-    local host_part = route.ip
-    if route.ip:find(":") then
-        host_part = "[" .. route.ip .. "]"
-    end
-
-    local url = protocol .. "://" .. host_part .. ":" .. target_port .. hc.path
-
-    local res, err = httpc:request_uri(url, {
-        method = "HEAD",
-        headers = {
-            ["Host"] = host_header,
-            ["X-Health-Check"] = "1",
-        },
-        ssl_verify = true,
-    })
-
-    if not res then
-        ngx.log(ngx.WARN, "Health check failed for ", route.ip, ":", target_port, " - ", err)
-        return false
-    end
-
-    local healthy = res.status == 200
-    if not healthy then
-        ngx.log(ngx.WARN, "Health check returned ", res.status, " for ", route.ip, ":", target_port)
-    end
-
-    return healthy
-end
-
 -- Helper: Filter routes by scheme (http or https)
 -- Returns routes matching the requested scheme, or all routes if no match found
 local function filter_routes_by_scheme(routes, required_scheme)
@@ -400,11 +307,9 @@ local function filter_routes_by_scheme(routes, required_scheme)
     return filtered
 end
 
--- Helper: Sort and prepare routes for failover
--- Filters by scheme, sorts by passive health status and priority
--- Returns all routes (healthy first, then unhealthy as fallback)
+-- Helper: Select best route by priority
 -- Supports force routing via X-Mesh-Force header
-local function prepare_routes_for_failover(routes, user_domain, cache, req_id)
+local function select_best_route(routes, req_id)
     if not routes or #routes == 0 then
         return nil
     end
@@ -412,76 +317,34 @@ local function prepare_routes_for_failover(routes, user_domain, cache, req_id)
     -- Check for force routing header
     local force_mode = ngx.var.http_x_mesh_force or ""
 
-    -- Skip scheme filtering - let priority and failover handle route selection
-    -- Tunnel routes always use HTTP internally regardless of client scheme
-    -- The build_backend_url_from_route function handles protocol selection per route type
-    local scheme_filtered_routes = routes
-
-    if #scheme_filtered_routes == 0 then
-        return routes
-    end
-
-    -- Handle forced routing (direct or tunnel) - return single route
     if force_mode == "direct" then
-        for _, route in ipairs(scheme_filtered_routes) do
+        for _, route in ipairs(routes) do
             if route.source == "agent" then
-                ngx.log(ngx.INFO, "[", req_id, "] force_routing mode=direct source=agent ip=", route.ip)
-                return {route}
+                ngx.log(ngx.INFO, "[", req_id, "] force_routing mode=direct")
+                return route
             end
         end
         ngx.log(ngx.WARN, "[", req_id, "] force_routing mode=direct no_agent_route_found")
     elseif force_mode == "tunnel" then
-        for _, route in ipairs(scheme_filtered_routes) do
+        for _, route in ipairs(routes) do
             if route.source == "tunnel" then
-                ngx.log(ngx.INFO, "[", req_id, "] force_routing mode=tunnel source=tunnel ip=", route.ip)
-                return {route}
+                ngx.log(ngx.INFO, "[", req_id, "] force_routing mode=tunnel")
+                return route
             end
         end
         ngx.log(ngx.WARN, "[", req_id, "] force_routing mode=tunnel no_tunnel_route_found")
     end
 
-    -- Separate healthy and passively unhealthy routes
-    local healthy_routes = {}
-    local unhealthy_routes = {}
-
-    for _, route in ipairs(scheme_filtered_routes) do
-        if proxy.is_passively_unhealthy(route) then
-            table.insert(unhealthy_routes, route)
-            ngx.log(ngx.INFO, "[", req_id, "] route_passively_unhealthy ip=", route.ip, ":", route.port or 443)
-        else
-            table.insert(healthy_routes, route)
-        end
-    end
-
-    -- Sort each group by priority (lower = better)
-    local function by_priority(a, b)
+    -- Sort by priority (lower = better)
+    table.sort(routes, function(a, b)
         return (a.priority or 999) < (b.priority or 999)
-    end
-    table.sort(healthy_routes, by_priority)
-    table.sort(unhealthy_routes, by_priority)
+    end)
 
-    -- Combine: healthy routes first, then unhealthy as fallback
-    local sorted_routes = {}
-    for _, route in ipairs(healthy_routes) do
-        table.insert(sorted_routes, route)
-    end
-    for _, route in ipairs(unhealthy_routes) do
-        table.insert(sorted_routes, route)
-    end
+    local best = routes[1]
+    ngx.log(ngx.INFO, "[", req_id, "] route_selected ip=", best.ip,
+        " port=", best.port, " source=", best.source or "unknown")
 
-    ngx.log(ngx.INFO, "[", req_id, "] routes_prepared total=", #sorted_routes, " healthy=", #healthy_routes, " unhealthy=", #unhealthy_routes)
-
-    return sorted_routes
-end
-
--- Helper: Select best healthy route (legacy - kept for compatibility)
--- Now wraps prepare_routes_for_failover and returns first route
-local function select_best_route(routes, user_domain, cache, req_id)
-    local sorted = prepare_routes_for_failover(routes, user_domain, cache, req_id)
-    if sorted and #sorted > 0 then
-        return sorted[1]
-    end
-    return nil
+    return best
 end
 
 -- Main resolution logic (v2)
@@ -527,7 +390,7 @@ local function resolve()
     local cache = get_cache()
 
     -- Check cache for routes data (JSON string)
-    local sorted_routes = nil
+    local best_route = nil
     local cached_routes_json = nil
     if cache then
         cached_routes_json = cache:get("routes:" .. subdomain)
@@ -535,15 +398,15 @@ local function resolve()
             local cached_routes = cjson.decode(cached_routes_json)
             if cached_routes and #cached_routes > 0 then
                 ngx.log(ngx.INFO, "[", req_id, "] cache_hit subdomain=", subdomain, " routes_count=", #cached_routes, " elapsed=", elapsed_ms(start_time), "ms")
-                -- Prepare routes with passive health filtering
-                sorted_routes = prepare_routes_for_failover(cached_routes, host, cache, req_id)
+                -- Select best route by priority
+                best_route = select_best_route(cached_routes, req_id)
                 -- Continue to WebSocket check below (don't return early)
             end
         end
     end
 
     -- Only fetch from backend if no cache hit
-    if not sorted_routes then
+    if not best_route then
         ngx.log(ngx.INFO, "[", req_id, "] cache_miss subdomain=", subdomain)
 
         -- Query backend (try v2 first, fall back to v1)
@@ -582,30 +445,26 @@ local function resolve()
 
         ngx.log(ngx.INFO, "[", req_id, "] routes_found count=", #routes)
 
-        -- Build user domain for health checks
-        local user_domain = (data.domainName or subdomain) .. "." .. (data.serverDomain or config.server_domain)
+        -- Select best route by priority
+        best_route = select_best_route(routes, req_id)
 
-        -- Prepare routes for failover (sorted by passive health and priority)
-        sorted_routes = prepare_routes_for_failover(routes, user_domain, cache, req_id)
-
-        if not sorted_routes or #sorted_routes == 0 then
-            ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_healthy_routes subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
+        if not best_route then
+            ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_route_selected subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
             ngx.exit(ngx.HTTP_BAD_GATEWAY)
             return
         end
 
-        -- Log first (primary) route for debugging
-        local primary_route = sorted_routes[1]
-        local protocol = primary_route.scheme or "https"
-        if primary_route.source == "tunnel" then
+        -- Log selected route for debugging
+        local protocol = best_route.scheme or "https"
+        if best_route.source == "tunnel" then
             protocol = "http"
         end
 
-        ngx.log(ngx.INFO, "[", req_id, "] primary_route ip=", primary_route.ip, " port=", primary_route.port or 443,
-            " scheme=", protocol, " source=", primary_route.source or "unknown",
-            " priority=", primary_route.priority or "nil", " total_routes=", #sorted_routes)
+        ngx.log(ngx.INFO, "[", req_id, "] route_selected ip=", best_route.ip, " port=", best_route.port or 443,
+            " scheme=", protocol, " source=", best_route.source or "unknown",
+            " priority=", best_route.priority or "nil")
 
-        -- Cache routes for future requests (cache raw routes, not sorted)
+        -- Cache routes for future requests (cache raw routes, not selected)
         if cache then
             local cache_ttl = config.cache_ttl or 60
             local routes_json = cjson.encode(routes)
@@ -616,9 +475,9 @@ local function resolve()
                 ngx.log(ngx.INFO, "[", req_id, "] cache_set subdomain=", subdomain, " ttl=", cache_ttl)
             end
         end
-    end  -- end if not sorted_routes
+    end  -- end if not best_route
 
-    ngx.log(ngx.INFO, "[", req_id, "] resolve_complete subdomain=", subdomain, " routes=", #sorted_routes, " elapsed=", elapsed_ms(start_time), "ms")
+    ngx.log(ngx.INFO, "[", req_id, "] resolve_complete subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
 
     -- Set request ID header for correlation in logs
     ngx.req.set_header("X-Request-ID", req_id)
@@ -627,7 +486,6 @@ local function resolve()
     -- WebSocket requests use proxy_pass (no failover) because lua-resty-http
     -- doesn't support WebSocket protocol upgrades
     if is_websocket_request() then
-        local best_route = sorted_routes[1]
         local backend_url = build_backend_url_from_route(best_route)
 
         if not backend_url then
@@ -662,8 +520,8 @@ local function resolve()
         return ngx.exec("@websocket")
     end
 
-    -- Store routes in context for content_handler (regular HTTP requests)
-    ngx.ctx.routes = sorted_routes
+    -- Store route in context for content_handler (regular HTTP requests)
+    ngx.ctx.route = best_route
 end
 
 -- Execute resolution

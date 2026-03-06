@@ -1,21 +1,29 @@
 --[[
-    resolver.lua - Domain resolution for mesh-router-gateway (v2)
+    resolver.lua - Domain resolution for mesh-router-gateway
 
     Resolves incoming domain requests to backend IP:port by querying
     the mesh-router-backend API. Supports route selection by priority.
+    Sets nginx variables for native proxy_pass handling.
 
     Flow:
     1. Extract subdomain from Host header
     2. Check local cache for routes
     3. If cache miss, query mesh-router-backend /resolve/v2/:domain
     4. Select best route by priority
-    5. Store route in ngx.ctx for content_handler.lua to use
+    5. Set nginx variables ($backend, $proxy_host, $ws_upgrade, etc.)
     6. If domain not found/no routes, fall back to config.default (landing page)
+
+    Nginx Variables Set:
+    - $backend: Target URL (e.g., https://203.0.113.10:443)
+    - $proxy_host: Host header for downstream routing
+    - $proxy_ssl_name: SNI name for HTTPS backends
+    - $ws_upgrade: "websocket" for WS requests, "" otherwise
+    - $ws_connection: "upgrade" for WS requests, "" otherwise
+    - $mesh_route: Route tracing info (when X-Mesh-Trace is set)
 
     Route Selection:
     - Routes sorted by priority (lower = better)
-    - Best route selected and passed to content_handler
-    - No failover - routes are validated at registration time (backend)
+    - Best route selected (no failover - routes validated at registration)
 
     Default Backend Fallback:
     - If config.default is set, unclaimed domains route to landing page
@@ -486,56 +494,53 @@ local function resolve()
     -- Set request ID header for correlation in logs
     ngx.req.set_header("X-Request-ID", req_id)
 
-    -- Check if this is a WebSocket request
-    -- WebSocket requests use proxy_pass (no failover) because lua-resty-http
-    -- doesn't support WebSocket protocol upgrades
-    if is_websocket_request() then
-        local backend_url = build_backend_url_from_route(best_route)
+    -- Build backend URL from selected route
+    local backend_url = build_backend_url_from_route(best_route)
 
-        if not backend_url then
-            ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=invalid_websocket_backend subdomain=", subdomain)
-            ngx.exit(ngx.HTTP_BAD_GATEWAY)
-            return
-        end
-
-        -- Set nginx variables for proxy_pass
-        ngx.var.backend = backend_url
-
-        -- Set proxy host for downstream routing (Caddy needs original Host header)
-        -- CF Worker mode: use X-Mesh-Route-Host header
-        -- Direct mode: use original Host header
-        ngx.var.proxy_host = ngx.var.http_x_mesh_route_host or host
-
-        -- Set WebSocket upgrade header
-        -- CF Worker sends X-Mesh-WebSocket but not the actual Upgrade header
-        -- Direct mode: use original Upgrade header
-        ngx.var.ws_upgrade = ngx.var.http_upgrade or "websocket"
-
-        -- Set SSL name for SNI
-        local protocol = best_route.scheme or "https"
-        if best_route.source == "tunnel" then
-            protocol = "http"
-        end
-        if protocol == "https" then
-            ngx.var.proxy_ssl_name = host
-        end
-
-        -- Set mesh route for tracing
-        local trace_enabled = ngx.var.http_x_mesh_trace ~= nil
-        if trace_enabled then
-            ngx.var.mesh_route = (best_route.source or "unknown") .. ",pcs"
-        else
-            ngx.var.mesh_route = ""
-        end
-
-        ngx.log(ngx.INFO, "[", req_id, "] websocket_request redirecting to @websocket backend=", backend_url)
-
-        -- Redirect to @websocket internal location
-        return ngx.exec("@websocket")
+    if not backend_url then
+        ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=invalid_backend subdomain=", subdomain)
+        ngx.exit(ngx.HTTP_BAD_GATEWAY)
+        return
     end
 
-    -- Store route in context for content_handler (regular HTTP requests)
-    ngx.ctx.route = best_route
+    -- Set nginx variables for proxy_pass
+    ngx.var.backend = backend_url
+
+    -- Set proxy host for downstream routing (Caddy needs original Host header)
+    -- CF Worker mode: use X-Mesh-Route-Host header
+    -- Direct mode: use original Host header
+    ngx.var.proxy_host = ngx.var.http_x_mesh_route_host or host
+
+    -- Set SSL name for SNI on HTTPS backends
+    local protocol = best_route.scheme or "https"
+    if best_route.source == "tunnel" then
+        protocol = "http"
+    end
+    if protocol == "https" then
+        ngx.var.proxy_ssl_name = host
+    end
+
+    -- Set WebSocket upgrade headers if this is a WebSocket request
+    -- CF Worker sends X-Mesh-WebSocket but not the actual Upgrade header
+    -- For HTTP requests, set empty strings (preserves default behavior)
+    if is_websocket_request() then
+        ngx.var.ws_upgrade = ngx.var.http_upgrade or "websocket"
+        ngx.var.ws_connection = "upgrade"
+        ngx.log(ngx.INFO, "[", req_id, "] websocket_request backend=", backend_url)
+    else
+        ngx.var.ws_upgrade = ""
+        ngx.var.ws_connection = ""
+    end
+
+    -- Set mesh route for tracing
+    local trace_enabled = ngx.var.http_x_mesh_trace ~= nil
+    if trace_enabled then
+        ngx.var.mesh_route = (best_route.source or "unknown") .. ",pcs"
+    else
+        ngx.var.mesh_route = ""
+    end
+
+    ngx.log(ngx.INFO, "[", req_id, "] request_routing backend=", backend_url)
 end
 
 -- Execute resolution

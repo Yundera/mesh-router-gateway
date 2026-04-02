@@ -34,6 +34,9 @@ if [ ! -f "${CA_CERT_PATH}" ]; then
     exit 1
 fi
 
+# Append mesh CA to system CA bundle so proxy_ssl_verify trusts our certs
+cat "${CA_CERT_PATH}" >> /etc/ssl/certs/ca-certificates.crt
+
 # Generate Lua config from template
 envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${DEFAULT_BACKEND}' \
     < /etc/nginx/lua/config.lua.template \

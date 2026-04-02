@@ -258,6 +258,8 @@ local function resolve_from_backend_v1(subdomain, req_id)
 end
 
 -- Helper: Build backend URL from route
+-- Always connects via route.ip (no DNS needed).
+-- For domain-type routes, route.domain is used for SNI via proxy_ssl_name.
 local function build_backend_url_from_route(route)
     local host_ip = route.ip
     local target_port = route.port or 443
@@ -353,7 +355,8 @@ local function select_best_route(routes, req_id)
     end)
 
     local best = routes[1]
-    ngx.log(ngx.INFO, "[", req_id, "] route_selected ip=", best.ip,
+    local target = (best.type == "domain" and best.domain) and best.domain or best.ip
+    ngx.log(ngx.INFO, "[", req_id, "] route_selected target=", target,
         " port=", best.port, " source=", best.source or "unknown")
 
     return best
@@ -457,6 +460,10 @@ local function resolve()
 
         ngx.log(ngx.INFO, "[", req_id, "] routes_found count=", #routes)
 
+        -- Filter routes by original request scheme (X-Forwarded-Proto or connection scheme)
+        local original_scheme = ngx.var.http_x_forwarded_proto or ngx.var.scheme
+        routes = filter_routes_by_scheme(routes, original_scheme)
+
         -- Select best route by priority
         best_route = select_best_route(routes, req_id)
 
@@ -512,12 +519,13 @@ local function resolve()
     ngx.var.proxy_host = ngx.var.http_x_mesh_route_host or host
 
     -- Set SSL name for SNI on HTTPS backends
+    -- Use route domain (e.g. nip.io) for SNI so Caddy serves the correct cert
     local protocol = best_route.scheme or "https"
     if best_route.source == "tunnel" then
         protocol = "http"
     end
     if protocol == "https" then
-        ngx.var.proxy_ssl_name = host
+        ngx.var.proxy_ssl_name = (best_route.type == "domain" and best_route.domain) and best_route.domain or host
     end
 
     -- Set WebSocket upgrade headers if this is a WebSocket request

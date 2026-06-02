@@ -141,6 +141,46 @@ local function extract_subdomain(host, server_domain)
     return last_segment
 end
 
+-- Helper: Extract the app label (everything before the username segment).
+-- Mirrors the CF Worker's parseHost. Used for the usage (DAU) KPI.
+-- e.g. "nextcloud.alice.example.com" -> "nextcloud"
+--      "admin-alice.example.com"     -> "admin"
+--      "alice.example.com"           -> "_root" (bare user domain, no app)
+local function extract_app(host, server_domain)
+    if not host or not server_domain then
+        return "_root"
+    end
+    host = host:gsub(":%d+$", "")
+    local suffix = "." .. server_domain
+    local prefix = host:sub(1, #host - #suffix)
+    if prefix == "" then
+        return "_root"
+    end
+
+    local parts = {}
+    for part in prefix:gmatch("[^.]+") do
+        table.insert(parts, part)
+    end
+
+    -- Dot-separated: app is everything except the last (username) segment.
+    if #parts > 1 then
+        table.remove(parts)
+        return table.concat(parts, ".")
+    end
+
+    -- Single segment: dash-separated "app-user" -> app is before the last dash.
+    local seg = parts[1]
+    local dash_pos = seg:match(".*()-")
+    if dash_pos then
+        local app = seg:sub(1, dash_pos - 1)
+        if app ~= "" then
+            return app
+        end
+    end
+
+    return "_root"
+end
+
 -- Helper: Query mesh-router-backend for domain resolution (v2 API)
 local function resolve_from_backend_v2(subdomain, req_id)
     local start_time = ngx.now()
@@ -387,6 +427,9 @@ local function resolve()
     ngx.ctx.original_host = host
     ngx.ctx.proxy_host = host
 
+    -- Stash the app label for the usage (DAU) KPI, read in log_by_lua_block.
+    ngx.ctx.app_name = extract_app(host, config.server_domain)
+
     -- Set proxy_host for nginx (used by default backend path)
     ngx.var.proxy_host = host
 
@@ -413,6 +456,12 @@ local function resolve()
             local cached_routes = cjson.decode(cached_routes_json)
             if cached_routes and #cached_routes > 0 then
                 ngx.log(ngx.INFO, "[", req_id, "] cache_hit subdomain=", subdomain, " routes_count=", #cached_routes, " elapsed=", elapsed_ms(start_time), "ms")
+                -- Recover the uid cached alongside the routes so cache-hit requests
+                -- still carry it into log_by_lua_block (the backend is not re-queried).
+                local cached_uid = cache:get("uid:" .. subdomain)
+                if cached_uid and cached_uid ~= "" then
+                    ngx.ctx.user_id = cached_uid
+                end
                 -- Select best route by priority
                 best_route = select_best_route(cached_routes, req_id)
                 -- Continue to WebSocket check below (don't return early)
@@ -446,6 +495,9 @@ local function resolve()
             end
             return
         end
+
+        -- Capture uid for the usage (DAU) KPI (read in log_by_lua_block).
+        ngx.ctx.user_id = data.userId
 
         -- Check if we have routes
         local routes = data.routes
@@ -492,6 +544,10 @@ local function resolve()
                 ngx.log(ngx.WARN, "[", req_id, "] cache_set_failed err=", cache_err)
             else
                 ngx.log(ngx.INFO, "[", req_id, "] cache_set subdomain=", subdomain, " ttl=", cache_ttl)
+            end
+            -- Cache uid alongside routes so cache-hit requests keep it for usage tracking.
+            if data.userId and data.userId ~= "" then
+                cache:set("uid:" .. subdomain, data.userId, cache_ttl)
             end
         end
     end  -- end if not best_route

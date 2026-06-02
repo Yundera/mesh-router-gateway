@@ -22,6 +22,7 @@ COPY nginx/gateway.conf /etc/nginx/conf.d/gateway.conf
 
 # Copy Lua scripts to nginx lua dir
 COPY nginx/lua/resolver.lua /etc/nginx/lua/resolver.lua
+COPY nginx/lua/usage.lua /etc/nginx/lua/usage.lua
 COPY nginx/lua/config.lua.template /etc/nginx/lua/config.lua.template
 
 # Copy entrypoint

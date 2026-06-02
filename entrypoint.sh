@@ -8,10 +8,15 @@ export SERVER_DOMAIN="${SERVER_DOMAIN:-localhost}"
 export BACKEND_URL="${BACKEND_URL:-http://localhost:8192}"
 export CACHE_TTL="${CACHE_TTL:-60}"
 export DEFAULT_BACKEND="${DEFAULT_BACKEND:-http://127.0.0.1:8080}"
+# Usage (DAU) ingest: defaults to the backend's internal endpoint; secret = SERVICE_API_KEY.
+# Leave USAGE_INGEST_URL empty (or unset with no BACKEND_URL) to disable usage notifications.
+export USAGE_INGEST_URL="${USAGE_INGEST_URL:-${BACKEND_URL}/internal/usage/ingest}"
+export USAGE_INGEST_SECRET="${USAGE_INGEST_SECRET:-${SERVICE_API_KEY:-}}"
 
 echo "  SERVER_DOMAIN: ${SERVER_DOMAIN}"
 echo "  BACKEND_URL: ${BACKEND_URL}"
 echo "  CACHE_TTL: ${CACHE_TTL}s"
+echo "  USAGE_INGEST_URL: ${USAGE_INGEST_URL}"
 
 # Fetch CA certificate from backend API
 echo "Fetching CA certificate from backend..."
@@ -38,12 +43,13 @@ fi
 cat "${CA_CERT_PATH}" >> /etc/ssl/certs/ca-certificates.crt
 
 # Generate Lua config from template
-envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${DEFAULT_BACKEND}' \
+envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${DEFAULT_BACKEND} ${USAGE_INGEST_URL} ${USAGE_INGEST_SECRET}' \
     < /etc/nginx/lua/config.lua.template \
     > /etc/nginx/lua/config.lua
 
 echo "Config generated:"
-cat /etc/nginx/lua/config.lua
+# Redact the usage ingest secret so it never lands in container logs.
+sed 's/\(usage_ingest_secret = "\)[^"]*\(".*\)/\1***REDACTED***\2/' /etc/nginx/lua/config.lua
 
 # Create log files
 mkdir -p /var/log/nginx

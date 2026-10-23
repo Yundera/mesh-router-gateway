@@ -100,7 +100,7 @@ local function extract_subdomain(host, server_domain)
 
     -- Check if host ends with server_domain
     local suffix = "." .. server_domain
-    if not host:sub(-#suffix) == suffix then
+    if host:sub(-#suffix) ~= suffix then
         return nil
     end
 
@@ -447,6 +447,10 @@ local function resolve()
 
     local cache = get_cache()
 
+    -- Routes are cached unfiltered: each request filters by its own scheme
+    -- (X-Forwarded-Proto or connection scheme)
+    local original_scheme = ngx.var.http_x_forwarded_proto or ngx.var.scheme
+
     -- Check cache for routes data (JSON string)
     local best_route = nil
     local cached_routes_json = nil
@@ -463,7 +467,7 @@ local function resolve()
                     ngx.ctx.user_id = cached_uid
                 end
                 -- Select best route by priority
-                best_route = select_best_route(cached_routes, req_id)
+                best_route = select_best_route(filter_routes_by_scheme(cached_routes, original_scheme), req_id)
                 -- Continue to WebSocket check below (don't return early)
             end
         end
@@ -512,12 +516,8 @@ local function resolve()
 
         ngx.log(ngx.INFO, "[", req_id, "] routes_found count=", #routes)
 
-        -- Filter routes by original request scheme (X-Forwarded-Proto or connection scheme)
-        local original_scheme = ngx.var.http_x_forwarded_proto or ngx.var.scheme
-        routes = filter_routes_by_scheme(routes, original_scheme)
-
-        -- Select best route by priority
-        best_route = select_best_route(routes, req_id)
+        -- Select best route by priority among those matching the request scheme
+        best_route = select_best_route(filter_routes_by_scheme(routes, original_scheme), req_id)
 
         if not best_route then
             ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_route_selected subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")

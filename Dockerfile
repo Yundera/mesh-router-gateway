@@ -1,7 +1,7 @@
 # mesh-router-gateway
 # Lightweight HTTP reverse proxy with dynamic domain resolution
 
-FROM openresty/openresty:alpine
+FROM openresty/openresty:1.29.2.5-alpine
 
 # Install minimal dependencies
 RUN apk add --no-cache \

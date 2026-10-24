@@ -108,9 +108,39 @@ This separation keeps the gateway simple and stateless.
 | `BACKEND_URL` | Resolution API URL | `http://localhost:8192` |
 | `CACHE_TTL` | Resolution cache TTL in seconds | `60` |
 | `DEFAULT_BACKEND` | Fallback URL for unclaimed domains (e.g., `http://landing-page:80`) | Empty (returns 404) |
-| `SSL_EMAIL` | Email for Let's Encrypt certificates | Required for SSL |
-| `PORT` | Gateway listen port | `80` |
-| `SSL_PORT` | Gateway SSL listen port | `443` |
+| `SERVICE_API_KEY` | Backend service key: usage ingest and delegated users' certificates | Empty |
+| `GATEWAY_TLS_PORT` | TLS listener port (`off` disables it); plain HTTP stays on `80` | `8443` |
+| `GATEWAY_TLS_PROXY_PROTOCOL` | `1` = the TLS listener expects PROXY protocol (behind a TCP passthrough) | `0` |
+
+### TLS
+
+The gateway terminates TLS itself on `GATEWAY_TLS_PORT`, choosing the certificate per SNI
+(`nginx/lua/certs.lua`):
+
+- `<user>.<domain>` and `<anything>.<user>.<domain>` of a user whose zone is delegated to
+  our nameservers get that user's `<user>.<domain>` + `*.<user>.<domain>` certificate,
+  issued by the backend (DNS-01 on its own zone) and fetched from
+  `GET <BACKEND_URL>/gateway/cert/<user>` with `SERVICE_API_KEY` (cached 10 min per worker);
+- everything else (dash names through Cloudflare, unknown hosts) gets a self-signed
+  fallback generated at start. Cloudflare's "Full" SSL mode accepts it.
+
+Two ways to put it on the internet:
+
+- **Gateway as the edge** (a host of its own): `GATEWAY_TLS_PORT=443`, publish `80` and `443`.
+- **Behind Traefik** (a host shared with other sites): keep `8443`, set
+  `GATEWAY_TLS_PROXY_PROTOCOL=1`, and pass the zone's TLS through with one generic TCP
+  router (labels on the gateway container; the HTTP router keeps port 80):
+
+  ```yaml
+  - "traefik.tcp.routers.gateway-tls.rule=HostSNIRegexp(`^.+\\.example\\.com$$`)"
+  - "traefik.tcp.routers.gateway-tls.entrypoints=websecure"
+  - "traefik.tcp.routers.gateway-tls.tls.passthrough=true"
+  - "traefik.tcp.services.gateway-tls.loadbalancer.server.port=8443"
+  - "traefik.tcp.services.gateway-tls.loadbalancer.proxyProtocol.version=2"
+  ```
+
+  TCP routers are matched before HTTP routers, so the rule must cover only names the
+  gateway serves (the zone's apex stays with its own routers).
 
 ### Example Docker Compose
 
@@ -127,9 +157,8 @@ services:
       - SERVER_DOMAIN=example.com
       - BACKEND_URL=http://resolution-backend:8192
       - CACHE_TTL=60
-      - SSL_EMAIL=admin@example.com
-    volumes:
-      - ./certs:/etc/letsencrypt
+      - SERVICE_API_KEY=${SERVICE_API_KEY}
+      - GATEWAY_TLS_PORT=443
     restart: unless-stopped
 ```
 

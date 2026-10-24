@@ -7,6 +7,7 @@ FROM openresty/openresty:1.29.2.5-alpine
 RUN apk add --no-cache \
     gettext \
     curl \
+    openssl \
     ca-certificates
 
 # Install lua-resty-http library
@@ -19,10 +20,12 @@ RUN rm -f /etc/nginx/conf.d/default.conf
 
 # Copy gateway configuration
 COPY nginx/gateway.conf /etc/nginx/conf.d/gateway.conf
+COPY nginx/gateway-common.conf /etc/nginx/gateway-common.conf
 
 # Copy Lua scripts to nginx lua dir
 COPY nginx/lua/resolver.lua /etc/nginx/lua/resolver.lua
 COPY nginx/lua/usage.lua /etc/nginx/lua/usage.lua
+COPY nginx/lua/certs.lua /etc/nginx/lua/certs.lua
 COPY nginx/lua/config.lua.template /etc/nginx/lua/config.lua.template
 
 # Copy entrypoint
@@ -39,6 +42,6 @@ ARG BUILD_VERSION=dev
 ENV BUILD_VERSION=${BUILD_VERSION}
 
 # Expose ports
-EXPOSE 80 443
+EXPOSE 80 8443
 
 ENTRYPOINT ["/entrypoint.sh"]

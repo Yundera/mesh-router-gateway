@@ -27,6 +27,9 @@ config.default = "${DEFAULT_BACKEND}"
 config.usage_ingest_url = "${USAGE_INGEST_URL}"
 config.usage_ingest_secret = "${USAGE_INGEST_SECRET}"
 
+-- Backend SERVICE_API_KEY: fetches delegated users' certificates (certs.lua).
+config.service_api_key = "${SERVICE_API_KEY}"
+
 -- Proxy configuration
 config.proxy_connect_timeout = 5000       -- Connection timeout in ms
 config.proxy_read_timeout = 60000         -- Read timeout in ms

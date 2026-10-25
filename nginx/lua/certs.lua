@@ -7,22 +7,25 @@
     <user>.<zone> and *.<user>.<zone>. The backend issues those (GatewayCerts) and
     serves them on GET /gateway/cert/<user>.
 
-    SNI <anything>.<user>.<zone> or <user>.<zone> -> that user's certificate.
-    Anything else (dash names through Cloudflare, unknown users, backend down) keeps
-    the server's self-signed fallback: what Cloudflare (SSL "Full") accepted from
-    Traefik before.
+    SNI <anything>.<user>.<zone> or <user>.<zone> -> that user's certificate, fetched
+    only for users the backend lists as holding one (certlist.lua): a dash name or an
+    unknown user costs no backend call. Anything else (dash names through Cloudflare,
+    unknown users, backend down) keeps the server's self-signed fallback: what
+    Cloudflare (SSL "Full") accepted from Traefik before.
 ]]
 
 local ssl = require "ngx.ssl"
 local http = require "resty.http"
 local cjson = require "cjson.safe"
-local lrucache = require "resty.lrucache"
 local config = require "config"
+local certlist = require "certlist"
 
--- Parsed certificates per worker: cdata cannot go into a shared dict.
-local CACHE_TTL = 600         -- a renewal reaches the gateways within 10 min
+-- Parsed certificates per worker, see certlist.cache.
+local CACHE_TTL = 3600        -- a renewal is picked up sooner: its notAfter changes in the list
 local MISS_TTL = 60           -- no certificate for this user (or backend down)
-local cache = lrucache.new(1000)
+-- Kept in a module: this file's top level runs again on every handshake, so a cache
+-- created here would start empty each time (gateway 1.3.0 fetched on every handshake).
+local cache = certlist.cache
 
 local function user_label(name)
     local suffix = "." .. config.server_domain:lower()
@@ -58,7 +61,7 @@ local function fetch(label)
     if not cert or not key then
         return nil, "unparsable certificate: " .. (cerr or kerr or "?")
     end
-    return { cert = cert, key = key }
+    return { cert = cert, key = key, not_after = data.notAfter }
 end
 
 local name = ssl.server_name()
@@ -70,8 +73,14 @@ if not label then
     return
 end
 
+local listed = certlist.not_after(label)
+if not listed then
+    return
+end
+
 local entry = cache:get(label)
-if entry == nil then
+-- ISO-8601 timestamps compare as strings: a newer one in the list = renewed since cached
+if entry == nil or (entry and (entry.not_after or "") < listed) then
     local found, err = fetch(label)
     if err then
         ngx.log(ngx.WARN, "gateway cert for ", label, ": ", err)

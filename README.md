@@ -120,7 +120,11 @@ The gateway terminates TLS itself on `GATEWAY_TLS_PORT`, choosing the certificat
 - `<user>.<domain>` and `<anything>.<user>.<domain>` of a user whose zone is delegated to
   our nameservers get that user's `<user>.<domain>` + `*.<user>.<domain>` certificate,
   issued by the backend (DNS-01 on its own zone) and fetched from
-  `GET <BACKEND_URL>/gateway/cert/<user>` with `SERVICE_API_KEY` (cached 10 min per worker);
+  `GET <BACKEND_URL>/gateway/cert/<user>` with `SERVICE_API_KEY`, cached per worker. Only
+  users on the backend's list are fetched: one worker polls `GET <BACKEND_URL>/gateway/certs`
+  (`{labels: {<user>: <notAfter>}}`) every 30 s (`nginx/lua/certlist.lua`), so a handshake
+  on any other name costs no backend call, and a renewal (a newer `notAfter`) replaces the
+  cached certificate within 30 s;
 - everything else (dash names through Cloudflare, unknown hosts) gets a self-signed
   fallback generated at start. Cloudflare's "Full" SSL mode accepts it.
 

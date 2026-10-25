@@ -26,6 +26,7 @@ COPY nginx/gateway-common.conf /etc/nginx/gateway-common.conf
 COPY nginx/lua/resolver.lua /etc/nginx/lua/resolver.lua
 COPY nginx/lua/usage.lua /etc/nginx/lua/usage.lua
 COPY nginx/lua/certs.lua /etc/nginx/lua/certs.lua
+COPY nginx/lua/certlist.lua /etc/nginx/lua/certlist.lua
 COPY nginx/lua/config.lua.template /etc/nginx/lua/config.lua.template
 
 # Copy entrypoint

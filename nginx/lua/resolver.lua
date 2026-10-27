@@ -297,10 +297,62 @@ local function resolve_from_backend_v1(subdomain, req_id)
     return nil, "no_ip"
 end
 
+-- Routed tunnel (config.tunnel_subnet): parsed once per worker.
+local function ipv4_to_int(ip)
+    local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    if not a then
+        return nil
+    end
+    return ((tonumber(a) * 256 + tonumber(b)) * 256 + tonumber(c)) * 256 + tonumber(d)
+end
+
+local tunnel_block, tunnel_base
+do
+    local net, prefix = (config.tunnel_subnet or ""):match("^([%d.]+)/(%d+)$")
+    local n = net and ipv4_to_int(net)
+    prefix = tonumber(prefix)
+    if n and prefix and prefix >= 8 and prefix <= 32 then
+        tunnel_block = 2 ^ (32 - prefix)
+        tunnel_base = math.floor(n / tunnel_block)
+    end
+end
+
+-- The box's WireGuard address when this tunnel route can be served routed: the gateway
+-- routes the tunnel subnet and the address the box registered lies inside it.
+local function routed_tunnel_ip(route)
+    if route.source ~= "tunnel" or not tunnel_base or type(route.tunnelIp) ~= "string" then
+        return nil
+    end
+    local n = ipv4_to_int(route.tunnelIp)
+    if n and math.floor(n / tunnel_block) == tunnel_base then
+        return route.tunnelIp
+    end
+    return nil
+end
+
+-- Protocol towards the box:
+-- - routed tunnel: HTTPS to the box's Caddy through WireGuard (TLS ends on the box)
+-- - provider tunnel: HTTP (the provider's nginx only speaks HTTP, TLS ended here)
+-- - agent routes: the route scheme (direct connection to the PCS)
+local function route_protocol(route)
+    if routed_tunnel_ip(route) then
+        return "https"
+    end
+    if route.source == "tunnel" then
+        return "http"
+    end
+    return route.scheme or "https"
+end
+
 -- Helper: Build backend URL from route
--- Always connects via route.ip (no DNS needed).
--- For domain-type routes, route.domain is used for SNI via proxy_ssl_name.
+-- Always connects via route.ip (no DNS needed), or the box's WireGuard address on a
+-- routed tunnel. For domain-type routes, route.domain is used for SNI via proxy_ssl_name.
 local function build_backend_url_from_route(route)
+    local routed_ip = routed_tunnel_ip(route)
+    if routed_ip then
+        return "https://" .. routed_ip .. ":443"
+    end
+
     local host_ip = route.ip
     local target_port = route.port or 443
 
@@ -308,15 +360,7 @@ local function build_backend_url_from_route(route)
         return nil
     end
 
-    -- Determine connection protocol:
-    -- - Tunnel routes: always use HTTP (tunnel entrance only speaks HTTP, TLS already terminated)
-    -- - Agent routes: use route scheme (direct connection to PCS which may speak HTTPS)
-    local protocol
-    if route.source == "tunnel" then
-        protocol = "http"
-    else
-        protocol = route.scheme or "https"
-    end
+    local protocol = route_protocol(route)
 
     -- Build host part with brackets for IPv6
     local host_part
@@ -526,10 +570,7 @@ local function resolve()
         end
 
         -- Log selected route for debugging
-        local protocol = best_route.scheme or "https"
-        if best_route.source == "tunnel" then
-            protocol = "http"
-        end
+        local protocol = route_protocol(best_route)
 
         ngx.log(ngx.INFO, "[", req_id, "] route_selected ip=", best_route.ip, " port=", best_route.port or 443,
             " scheme=", protocol, " source=", best_route.source or "unknown",
@@ -576,10 +617,7 @@ local function resolve()
 
     -- Set SSL name for SNI on HTTPS backends
     -- Use route domain (e.g. nip.io) for SNI so Caddy serves the correct cert
-    local protocol = best_route.scheme or "https"
-    if best_route.source == "tunnel" then
-        protocol = "http"
-    end
+    local protocol = route_protocol(best_route)
     if protocol == "https" then
         ngx.var.proxy_ssl_name = (best_route.type == "domain" and best_route.domain) and best_route.domain or host
     end
@@ -599,7 +637,11 @@ local function resolve()
     -- Set mesh route for tracing
     local trace_enabled = ngx.var.http_x_mesh_trace ~= nil
     if trace_enabled then
-        ngx.var.mesh_route = (best_route.source or "unknown") .. ",pcs"
+        local label = best_route.source or "unknown"
+        if routed_tunnel_ip(best_route) then
+            label = "tunnel-routed"
+        end
+        ngx.var.mesh_route = label .. ",pcs"
     else
         ngx.var.mesh_route = ""
     end

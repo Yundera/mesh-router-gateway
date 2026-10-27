@@ -26,6 +26,20 @@ echo "  CACHE_TTL: ${CACHE_TTL}s"
 echo "  USAGE_INGEST_URL: ${USAGE_INGEST_URL}"
 echo "  GATEWAY_TLS_PORT: ${GATEWAY_TLS_PORT} (proxy protocol: ${GATEWAY_TLS_PROXY_PROTOCOL})"
 
+# Routed tunnel: the WireGuard subnet (TUNNEL_SUBNET) is reached through the tunnel
+# provider's container (TUNNEL_VIA), so a tunnel route with a tunnelIp is served over TLS
+# to <tunnelIp>:443, straight to the box's Caddy. Needs NET_ADMIN, which only touches this
+# container's own network namespace. Without it, tunnel routes keep the provider's HTTP path.
+export TUNNEL_SUBNET="${TUNNEL_SUBNET:-}"
+if [ -n "${TUNNEL_SUBNET}" ]; then
+    if [ -n "${TUNNEL_VIA:-}" ] && ip route replace "${TUNNEL_SUBNET}" via "${TUNNEL_VIA}"; then
+        echo "  Routed tunnel: ${TUNNEL_SUBNET} via ${TUNNEL_VIA}"
+    else
+        echo "WARNING: routed tunnel disabled, cannot route ${TUNNEL_SUBNET} via ${TUNNEL_VIA:-(TUNNEL_VIA unset)} (NET_ADMIN?)"
+        TUNNEL_SUBNET=""
+    fi
+fi
+
 # Fetch CA certificate from backend API
 echo "Fetching CA certificate from backend..."
 MAX_RETRIES=30
@@ -51,7 +65,7 @@ fi
 cat "${CA_CERT_PATH}" >> /etc/ssl/certs/ca-certificates.crt
 
 # Generate Lua config from template
-envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${DEFAULT_BACKEND} ${USAGE_INGEST_URL} ${USAGE_INGEST_SECRET} ${SERVICE_API_KEY}' \
+envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${DEFAULT_BACKEND} ${USAGE_INGEST_URL} ${USAGE_INGEST_SECRET} ${SERVICE_API_KEY} ${TUNNEL_SUBNET}' \
     < /etc/nginx/lua/config.lua.template \
     > /etc/nginx/lua/config.lua
 

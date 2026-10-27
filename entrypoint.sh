@@ -7,7 +7,8 @@ echo "Starting mesh-router-gateway v${BUILD_VERSION:-dev}"
 export SERVER_DOMAIN="${SERVER_DOMAIN:-localhost}"
 export BACKEND_URL="${BACKEND_URL:-http://localhost:8192}"
 export CACHE_TTL="${CACHE_TTL:-60}"
-export DEFAULT_BACKEND="${DEFAULT_BACKEND:-http://127.0.0.1:8080}"
+# No default: empty = unknown names get a 404 (a fallback nothing listened on gave a 502).
+export DEFAULT_BACKEND="${DEFAULT_BACKEND:-}"
 # Usage (DAU) ingest: defaults to the backend's internal endpoint; secret = SERVICE_API_KEY.
 # Leave USAGE_INGEST_URL empty (or unset with no BACKEND_URL) to disable usage notifications.
 export USAGE_INGEST_URL="${USAGE_INGEST_URL:-${BACKEND_URL}/internal/usage/ingest}"

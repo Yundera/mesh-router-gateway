@@ -74,12 +74,19 @@ echo "Config generated:"
 sed -e 's/\(usage_ingest_secret = "\)[^"]*\(".*\)/\1***REDACTED***\2/' \
     -e 's/\(service_api_key = "\)[^"]*\(".*\)/\1***REDACTED***\2/' /etc/nginx/lua/config.lua
 
-# TLS server. A user's certificate comes from the backend per SNI; anything else gets
-# this self-signed fallback, which is what Cloudflare ("Full" SSL) accepted from the
-# proxy in front of the gateway before.
+# TLS front + TLS server.
+# The front (stream, sni_router.lua) listens on GATEWAY_TLS_PORT and passes a user's dot
+# names and apex through to the box untouched; everything else goes to the HTTP TLS
+# server on a local socket. There, a user's certificate comes from the backend per SNI;
+# anything else gets this self-signed fallback, which is what Cloudflare ("Full" SSL)
+# accepted from the proxy in front of the gateway before.
+# No stream realip module in OpenResty: terminated connections reach the HTTP server
+# from the local socket, without the client address (behind Cloudflare it was the edge's).
 TLS_CONF=/etc/nginx/conf.d/gateway-tls.conf
+FRONT_CONF=/etc/nginx/stream.d/gateway-tls-front.conf
+TLS_SOCKET=/var/run/nginx-tls.sock
 if [ "${GATEWAY_TLS_PORT}" = "off" ]; then
-    rm -f "${TLS_CONF}"
+    rm -f "${TLS_CONF}" "${FRONT_CONF}"
 else
     mkdir -p /etc/nginx/certs
     if [ ! -s /etc/nginx/certs/fallback.crt ]; then
@@ -89,18 +96,35 @@ else
     fi
     if [ "${GATEWAY_TLS_PROXY_PROTOCOL}" = "1" ]; then
         LISTEN_OPTS=" proxy_protocol"
-        # the listener only accepts PROXY protocol, so the header is the client address
-        REAL_IP="    set_real_ip_from 0.0.0.0/0;
-    set_real_ip_from ::/0;
-    real_ip_header proxy_protocol;"
     else
         LISTEN_OPTS=""
-        REAL_IP=""
     fi
+    rm -f "${TLS_SOCKET}"
+    cat > "${FRONT_CONF}" <<EOF
+log_format tls '\$remote_addr \$proxy_protocol_addr [\$time_local] \$ssl_preread_server_name '
+               '\$tls_mode \$upstream_addr \$status \$bytes_sent \$bytes_received \$session_time';
+
+server {
+    access_log /var/log/nginx/access.log tls;
+    listen ${GATEWAY_TLS_PORT}${LISTEN_OPTS};
+    listen [::]:${GATEWAY_TLS_PORT}${LISTEN_OPTS};
+    ssl_preread on;
+    resolver 127.0.0.11 valid=30s ipv6=off;
+    resolver_timeout 3s;
+
+    set \$tls_upstream "unix:${TLS_SOCKET}";
+    set \$tls_mode "terminate";
+    preread_by_lua_block {
+        require("sni_router").route()
+    }
+    proxy_pass \$tls_upstream;
+    proxy_connect_timeout 5s;
+    proxy_timeout 1h;
+}
+EOF
     cat > "${TLS_CONF}" <<EOF
 server {
-    listen ${GATEWAY_TLS_PORT} ssl${LISTEN_OPTS};
-    listen [::]:${GATEWAY_TLS_PORT} ssl${LISTEN_OPTS};
+    listen unix:${TLS_SOCKET} ssl;
     http2 on;
     server_name _;
 
@@ -109,7 +133,6 @@ server {
     ssl_certificate_by_lua_file /etc/nginx/lua/certs.lua;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:gateway_tls:10m;
-${REAL_IP}
 
     include /etc/nginx/gateway-common.conf;
 }

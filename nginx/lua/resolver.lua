@@ -498,6 +498,8 @@ local function resolve()
     -- Check cache for routes data (JSON string)
     local best_route = nil
     local cached_routes_json = nil
+    -- <label>.box.<zone>: SNI towards the box, once its certificate carries it (hopName)
+    local hop_name = nil
     if cache then
         cached_routes_json = cache:get("routes:" .. subdomain)
         if cached_routes_json then
@@ -510,6 +512,7 @@ local function resolve()
                 if cached_uid and cached_uid ~= "" then
                     ngx.ctx.user_id = cached_uid
                 end
+                hop_name = cache:get("hop:" .. subdomain)
                 -- Select best route by priority
                 best_route = select_best_route(filter_routes_by_scheme(cached_routes, original_scheme), req_id)
                 -- Continue to WebSocket check below (don't return early)
@@ -546,6 +549,7 @@ local function resolve()
 
         -- Capture uid for the usage (DAU) KPI (read in log_by_lua_block).
         ngx.ctx.user_id = data.userId
+        hop_name = data.hopName
 
         -- Check if we have routes
         local routes = data.routes
@@ -590,6 +594,7 @@ local function resolve()
             if data.userId and data.userId ~= "" then
                 cache:set("uid:" .. subdomain, data.userId, cache_ttl)
             end
+            cache:set("hop:" .. subdomain, type(hop_name) == "string" and hop_name or "", cache_ttl)
         end
     end  -- end if not best_route
 
@@ -615,11 +620,20 @@ local function resolve()
     -- Direct mode: use original Host header
     ngx.var.proxy_host = ngx.var.http_x_mesh_route_host or host
 
-    -- Set SSL name for SNI on HTTPS backends
-    -- Use route domain (e.g. nip.io) for SNI so Caddy serves the correct cert
+    -- Set SSL name for SNI on HTTPS backends:
+    -- - the box's hop name (<label>.box.<zone>) when its certificate carries it: the
+    --   connection is verified against that box, whatever IP or tunnel it goes through
+    -- - otherwise the route domain (e.g. <ip>.ip.<zone>) or the requested host
     local protocol = route_protocol(best_route)
     if protocol == "https" then
-        ngx.var.proxy_ssl_name = (best_route.type == "domain" and best_route.domain) and best_route.domain or host
+        local box_route = best_route.source == "agent" or best_route.source == "tunnel"
+        local hop_suffix = ".box." .. (config.server_domain or ""):lower()
+        if box_route and type(hop_name) == "string" and #hop_name > #hop_suffix
+            and hop_name:sub(-#hop_suffix) == hop_suffix then
+            ngx.var.proxy_ssl_name = hop_name
+        else
+            ngx.var.proxy_ssl_name = (best_route.type == "domain" and best_route.domain) and best_route.domain or host
+        end
     end
 
     -- Set WebSocket upgrade headers if this is a WebSocket request

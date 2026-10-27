@@ -108,25 +108,26 @@ This separation keeps the gateway simple and stateless.
 | `BACKEND_URL` | Resolution API URL | `http://localhost:8192` |
 | `CACHE_TTL` | Resolution cache TTL in seconds | `60` |
 | `DEFAULT_BACKEND` | Fallback URL for unclaimed domains (e.g., `http://landing-page:80`) | Empty (returns 404) |
-| `SERVICE_API_KEY` | Backend service key: usage ingest and delegated users' certificates | Empty |
+| `SERVICE_API_KEY` | Backend service key, the default usage ingest secret | Empty |
 | `GATEWAY_TLS_PORT` | TLS listener port (`off` disables it); plain HTTP stays on `80` | `8443` |
 | `GATEWAY_TLS_PROXY_PROTOCOL` | `1` = the TLS listener expects PROXY protocol (behind a TCP passthrough) | `0` |
 
 ### TLS
 
-The gateway terminates TLS itself on `GATEWAY_TLS_PORT`, choosing the certificate per SNI
-(`nginx/lua/certs.lua`):
+One key per name (mesh-router-nameserver `docs/phase-1.1-gateway-tls.md`). On
+`GATEWAY_TLS_PORT` an SNI router (`nginx/lua/sni_router.lua`) reads the name only:
 
-- `<user>.<domain>` and `<anything>.<user>.<domain>` of a user whose zone is delegated to
-  our nameservers get that user's `<user>.<domain>` + `*.<user>.<domain>` certificate,
-  issued by the backend (DNS-01 on its own zone) and fetched from
-  `GET <BACKEND_URL>/gateway/cert/<user>` with `SERVICE_API_KEY`, cached per worker. Only
-  users on the backend's list are fetched: one worker polls `GET <BACKEND_URL>/gateway/certs`
-  (`{labels: {<user>: <notAfter>}}`) every 30 s (`nginx/lua/certlist.lua`), so a handshake
-  on any other name costs no backend call, and a renewal (a newer `notAfter`) replaces the
-  cached certificate within 30 s;
-- everything else (dash names through Cloudflare, unknown hosts) gets a self-signed
-  fallback generated at start. Cloudflare's "Full" SSL mode accepts it.
+- a user's dot names and apex (`<anything>.<user>.<domain>`, `<user>.<domain>`) are
+  **passed through** untouched to the box's best TLS-capable route (public IP, or the
+  WireGuard address of a routed tunnel): the box presents its own certificate, the gateway
+  holds no key for them;
+- everything else (dash names through Cloudflare, `gateway.entrypoint.<domain>`, reserved
+  labels, unknown users) is **terminated** here with a self-signed fallback generated at
+  start. Cloudflare's "Full" SSL mode accepts it.
+
+Towards a box, the gateway connects with SNI `<user>.box.<domain>` and accepts only a
+certificate from the mesh CA carrying that name (the box's cert0), whatever IP or tunnel
+the route goes through. No public CA is trusted on that hop.
 
 Two ways to put it on the internet:
 

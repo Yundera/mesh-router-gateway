@@ -27,9 +27,6 @@ config.default = "${DEFAULT_BACKEND}"
 config.usage_ingest_url = "${USAGE_INGEST_URL}"
 config.usage_ingest_secret = "${USAGE_INGEST_SECRET}"
 
--- Backend SERVICE_API_KEY: fetches delegated users' certificates (certs.lua).
-config.service_api_key = "${SERVICE_API_KEY}"
-
 -- Routed tunnel: WireGuard subnet this gateway routes to (empty = provider HTTP path only).
 config.tunnel_subnet = "${TUNNEL_SUBNET}"
 

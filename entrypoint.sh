@@ -14,7 +14,7 @@ export DEFAULT_BACKEND="${DEFAULT_BACKEND:-}"
 export USAGE_INGEST_URL="${USAGE_INGEST_URL:-${BACKEND_URL}/internal/usage/ingest}"
 export USAGE_INGEST_SECRET="${USAGE_INGEST_SECRET:-${SERVICE_API_KEY:-}}"
 export SERVICE_API_KEY="${SERVICE_API_KEY:-}"
-# TLS listener (certificate per SNI, see nginx/lua/certs.lua): 8443 behind a TCP
+# TLS listener (SNI router, see nginx/lua/sni_router.lua): 8443 behind a TCP
 # passthrough (GATEWAY_TLS_PROXY_PROTOCOL=1 carries the client address), 443 on a
 # host where the gateway is the edge, "off" to disable.
 GATEWAY_TLS_PORT="${GATEWAY_TLS_PORT:-8443}"
@@ -61,25 +61,20 @@ if [ ! -f "${CA_CERT_PATH}" ]; then
     exit 1
 fi
 
-# Append mesh CA to system CA bundle so proxy_ssl_verify trusts our certs
-cat "${CA_CERT_PATH}" >> /etc/ssl/certs/ca-certificates.crt
-
 # Generate Lua config from template
-envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${DEFAULT_BACKEND} ${USAGE_INGEST_URL} ${USAGE_INGEST_SECRET} ${SERVICE_API_KEY} ${TUNNEL_SUBNET}' \
+envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${DEFAULT_BACKEND} ${USAGE_INGEST_URL} ${USAGE_INGEST_SECRET} ${TUNNEL_SUBNET}' \
     < /etc/nginx/lua/config.lua.template \
     > /etc/nginx/lua/config.lua
 
 echo "Config generated:"
 # Redact the usage ingest secret so it never lands in container logs.
-sed -e 's/\(usage_ingest_secret = "\)[^"]*\(".*\)/\1***REDACTED***\2/' \
-    -e 's/\(service_api_key = "\)[^"]*\(".*\)/\1***REDACTED***\2/' /etc/nginx/lua/config.lua
+sed -e 's/\(usage_ingest_secret = "\)[^"]*\(".*\)/\1***REDACTED***\2/' /etc/nginx/lua/config.lua
 
 # TLS front + TLS server.
 # The front (stream, sni_router.lua) listens on GATEWAY_TLS_PORT and passes a user's dot
 # names and apex through to the box untouched; everything else goes to the HTTP TLS
-# server on a local socket. There, a user's certificate comes from the backend per SNI;
-# anything else gets this self-signed fallback, which is what Cloudflare ("Full" SSL)
-# accepted from the proxy in front of the gateway before.
+# server on a local socket, which presents this self-signed fallback: what Cloudflare
+# ("Full" SSL) accepts from the proxy in front of the gateway.
 # No stream realip module in OpenResty: terminated connections reach the HTTP server
 # from the local socket, without the client address (behind Cloudflare it was the edge's).
 TLS_CONF=/etc/nginx/conf.d/gateway-tls.conf
@@ -130,7 +125,6 @@ server {
 
     ssl_certificate /etc/nginx/certs/fallback.crt;
     ssl_certificate_key /etc/nginx/certs/fallback.key;
-    ssl_certificate_by_lua_file /etc/nginx/lua/certs.lua;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:gateway_tls:10m;
 

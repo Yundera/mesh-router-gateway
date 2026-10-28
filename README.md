@@ -111,6 +111,8 @@ This separation keeps the gateway simple and stateless.
 | `SERVICE_API_KEY` | Backend service key, the default usage ingest secret | Empty |
 | `GATEWAY_TLS_PORT` | TLS listener port (`off` disables it); plain HTTP stays on `80` | `8443` |
 | `GATEWAY_TLS_PROXY_PROTOCOL` | `1` = the TLS listener expects PROXY protocol (behind a TCP passthrough) | `0` |
+| `GATEWAY_FORWARDED_FOR` | `append` keeps the client's X-Forwarded-For (Cloudflare's Worker puts the client there); `replace` sends only the address the gateway saw (set it once the gateway is the edge) | `append` |
+| `GATEWAY_TLS_REALIP_FROM` | Sources whose PROXY header gives the client address (with `GATEWAY_TLS_PROXY_PROTOCOL=1`), space-separated CIDRs | private ranges |
 
 ### TLS
 
@@ -146,6 +148,23 @@ Two ways to put it on the internet:
 
   TCP routers are matched before HTTP routers, so the rule must cover only names the
   gateway serves (the zone's apex stays with its own routers).
+
+**Client address.** The image's nginx is rebuilt with `ngx_stream_realip_module` (the
+official OpenResty image does not compile it; see the Dockerfile): behind Traefik the
+front takes the client address from Traefik's PROXY header, trusting
+`GATEWAY_TLS_REALIP_FROM` (the port is not published, so only containers on the gateway's
+networks can reach it). The front then sends its own PROXY v2 header on:
+
+- to the HTTP TLS server (local socket, `real_ip_header proxy_protocol`): `$remote_addr`,
+  `X-Real-IP` and the appended `X-Forwarded-For` carry the client;
+- to a box whose `/resolve/v2` says `proxyProtocol: true` (its Caddy takes the header from
+  the gateways, mesh-router-caddy 1.4.4+);
+- any other box goes through a strip relay (`unix:/var/run/nginx-strip.sock`) that ends the
+  header, so its TLS arrives exactly as before. The decision is cached per user with the
+  route (`sni_routes`, 60 s).
+
+The access log of the TLS front (`tls` format) shows the client first, then the address
+the connection came from (Traefik's).
 
 ### Example Docker Compose
 

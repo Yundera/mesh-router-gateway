@@ -11,7 +11,13 @@
     labels, unknown users, and boxes with no TLS-capable route (provider-only tunnel).
 
     Decision per user label, cached CACHE_TTL seconds in ngx.shared.sni_routes
-    ("host:port" to pass through, "-" to terminate).
+    ("host:port" to pass through, "host:port pp" when the box takes a PROXY header,
+    "-" to terminate).
+
+    The front sends a PROXY v2 header on every connection (the client's address). A box
+    that reported it takes one (`proxyProtocol` in /resolve/v2) gets it straight; any
+    other box is reached through the strip relay (STRIP), which ends the header and runs
+    route_strip() for the same decision.
 ]]
 
 local http = require "resty.http"
@@ -22,6 +28,7 @@ local _M = {}
 
 local CACHE_TTL = 60
 local TERMINATE = "unix:/var/run/nginx-tls.sock"
+local STRIP = "unix:/var/run/nginx-strip.sock"
 
 -- Labels that are never users (architecture.md §3.4), plus the gateway's own entrypoint.
 local RESERVED = {
@@ -104,17 +111,22 @@ local function lookup(label)
     if not data then
         return nil, "bad backend answer"
     end
-    return tls_target(data.routes) or "-"
+    local target = tls_target(data.routes)
+    if not target then
+        return "-"
+    end
+    return data.proxyProtocol == true and (target .. " pp") or target
 end
 
-function _M.route()
+-- The cached decision for the connection's SNI: "host:port[ pp]", "-", or nil (terminate).
+local function decide()
     local name = ngx.var.ssl_preread_server_name
     if not name or name == "" then
-        return
+        return nil
     end
     local label = candidate_label(name:lower())
     if not label then
-        return
+        return nil
     end
 
     local cache = ngx.shared.sni_routes
@@ -124,15 +136,40 @@ function _M.route()
         target, err = lookup(label)
         if not target then
             ngx.log(ngx.WARN, "sni_router: ", label, ": ", err, " (terminating)")
-            return -- not cached: the next handshake asks again
+            return nil -- not cached: the next handshake asks again
         end
         cache:set(label, target, CACHE_TTL)
     end
+    return target
+end
 
-    if target ~= "-" then
-        ngx.var.tls_upstream = target
-        ngx.var.tls_mode = "passthrough"
+-- The front: pass through (straight, or through the strip relay), or terminate.
+function _M.route()
+    local target = decide()
+    if not target or target == "-" then
+        return
     end
+    local addr, pp = target:match("^(%S+) (pp)$")
+    if pp then
+        ngx.var.tls_upstream = addr
+        ngx.var.tls_mode = "passthrough"
+    else
+        ngx.var.tls_upstream = STRIP
+        ngx.var.tls_mode = "passthrough-strip"
+    end
+end
+
+-- The strip relay: the box without its PROXY header. The front only sends a connection
+-- here for a passthrough; if the decision changed in between (cache expiry), close it:
+-- the HTTP server would expect a header this relay no longer sends.
+function _M.route_strip()
+    local target = decide()
+    local addr = target and target ~= "-" and target:match("^(%S+)")
+    if not addr then
+        ngx.log(ngx.WARN, "sni_router: strip relay without a passthrough decision, closing")
+        return ngx.exit(ngx.ERROR)
+    end
+    ngx.var.tls_upstream = addr
 end
 
 _M.TERMINATE = TERMINATE

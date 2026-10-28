@@ -70,16 +70,41 @@ echo "Config generated:"
 # Redact the usage ingest secret so it never lands in container logs.
 sed -e 's/\(usage_ingest_secret = "\)[^"]*\(".*\)/\1***REDACTED***\2/' /etc/nginx/lua/config.lua
 
+# X-Forwarded-For towards the box. append (default): the client's own value is kept in
+# front of the address this gateway saw, which is how Cloudflare's Worker hands over the
+# client while it is in front of the zone. replace: only the address this gateway saw (the
+# client, realip from the TLS front): set it once the gateway is the edge (cutoff), so a
+# client cannot put a fake address first. The box's Caddy reads the chain right to left
+# (trusted_proxies_strict) either way; this is for apps that read the leftmost value.
+GATEWAY_FORWARDED_FOR="${GATEWAY_FORWARDED_FOR:-append}"
+if [ "${GATEWAY_FORWARDED_FOR}" = "replace" ]; then
+    FORWARDED_FOR_VALUE='$remote_addr'
+else
+    FORWARDED_FOR_VALUE='$proxy_add_x_forwarded_for'
+fi
+cat > /etc/nginx/conf.d/00-forwarded-for.conf <<EOF
+map \$remote_addr \$mesh_forwarded_for {
+    default ${FORWARDED_FOR_VALUE};
+}
+EOF
+echo "  X-Forwarded-For: ${GATEWAY_FORWARDED_FOR}"
+
 # TLS front + TLS server.
 # The front (stream, sni_router.lua) listens on GATEWAY_TLS_PORT and passes a user's dot
 # names and apex through to the box untouched; everything else goes to the HTTP TLS
 # server on a local socket, which presents this self-signed fallback: what Cloudflare
 # ("Full" SSL) accepts from the proxy in front of the gateway.
-# No stream realip module in OpenResty: terminated connections reach the HTTP server
-# from the local socket, without the client address (behind Cloudflare it was the edge's).
+# Client address: behind a proxy (GATEWAY_TLS_PROXY_PROTOCOL=1) the front takes it from
+# that proxy's PROXY header (stream realip, rebuilt into the image), trusting the sources in
+# GATEWAY_TLS_REALIP_FROM. The front then sends its own PROXY header onwards: to the HTTP
+# TLS server (http realip, so X-Real-IP / X-Forwarded-For carry the client) and to boxes
+# that take one (`proxyProtocol` in /resolve/v2). A box that does not goes through the
+# strip relay, which ends the header and passes the TLS bytes on as before.
 TLS_CONF=/etc/nginx/conf.d/gateway-tls.conf
 FRONT_CONF=/etc/nginx/stream.d/gateway-tls-front.conf
 TLS_SOCKET=/var/run/nginx-tls.sock
+STRIP_SOCKET=/var/run/nginx-strip.sock
+GATEWAY_TLS_REALIP_FROM="${GATEWAY_TLS_REALIP_FROM:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}"
 if [ "${GATEWAY_TLS_PORT}" = "off" ]; then
     rm -f "${TLS_CONF}" "${FRONT_CONF}"
 else
@@ -89,21 +114,25 @@ else
             -subj "/CN=mesh-router-gateway" \
             -keyout /etc/nginx/certs/fallback.key -out /etc/nginx/certs/fallback.crt 2>/dev/null
     fi
+    LISTEN_OPTS=""
+    REALIP_CONF=""
     if [ "${GATEWAY_TLS_PROXY_PROTOCOL}" = "1" ]; then
         LISTEN_OPTS=" proxy_protocol"
-    else
-        LISTEN_OPTS=""
+        for net in ${GATEWAY_TLS_REALIP_FROM}; do
+            REALIP_CONF="${REALIP_CONF}    set_real_ip_from ${net};
+"
+        done
     fi
-    rm -f "${TLS_SOCKET}"
+    rm -f "${TLS_SOCKET}" "${STRIP_SOCKET}"
     cat > "${FRONT_CONF}" <<EOF
-log_format tls '\$remote_addr \$proxy_protocol_addr [\$time_local] \$ssl_preread_server_name '
+log_format tls '\$remote_addr \$realip_remote_addr [\$time_local] \$ssl_preread_server_name '
                '\$tls_mode \$upstream_addr \$status \$bytes_sent \$bytes_received \$session_time';
 
 server {
     access_log /var/log/nginx/access.log tls;
     listen ${GATEWAY_TLS_PORT}${LISTEN_OPTS};
     listen [::]:${GATEWAY_TLS_PORT}${LISTEN_OPTS};
-    ssl_preread on;
+${REALIP_CONF}    ssl_preread on;
     resolver 127.0.0.11 valid=30s ipv6=off;
     resolver_timeout 3s;
 
@@ -112,6 +141,25 @@ server {
     preread_by_lua_block {
         require("sni_router").route()
     }
+    proxy_protocol on;
+    proxy_pass \$tls_upstream;
+    proxy_connect_timeout 5s;
+    proxy_timeout 1h;
+}
+
+# Boxes that take no PROXY header: the front's header ends here, the TLS bytes go on.
+server {
+    listen unix:${STRIP_SOCKET} proxy_protocol;
+    set_real_ip_from unix:;
+    ssl_preread on;
+    resolver 127.0.0.11 valid=30s ipv6=off;
+    resolver_timeout 3s;
+
+    set \$tls_upstream "";
+    set \$tls_mode "strip";
+    preread_by_lua_block {
+        require("sni_router").route_strip()
+    }
     proxy_pass \$tls_upstream;
     proxy_connect_timeout 5s;
     proxy_timeout 1h;
@@ -119,9 +167,11 @@ server {
 EOF
     cat > "${TLS_CONF}" <<EOF
 server {
-    listen unix:${TLS_SOCKET} ssl;
+    listen unix:${TLS_SOCKET} ssl proxy_protocol;
     http2 on;
     server_name _;
+    set_real_ip_from unix:;
+    real_ip_header proxy_protocol;
 
     ssl_certificate /etc/nginx/certs/fallback.crt;
     ssl_certificate_key /etc/nginx/certs/fallback.key;

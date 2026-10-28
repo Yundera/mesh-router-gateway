@@ -107,6 +107,7 @@ This separation keeps the gateway simple and stateless.
 | `SERVER_DOMAIN` | Domain suffix (e.g., `example.com`) | Required |
 | `BACKEND_URL` | Resolution API URL | `http://localhost:8192` |
 | `CACHE_TTL` | Resolution cache TTL in seconds | `60` |
+| `RESOLVE_STALE_TTL` | Serve-stale: how long the last resolution (HTTP routes and TLS passthrough decision) is kept for use while the backend cannot answer (timeout, refused, 5xx; never on a 404). An unreachable backend is then skipped for 30 s. `0` = off | `86400` |
 | `DEFAULT_BACKEND` | Fallback URL for unclaimed domains (e.g., `http://landing-page:80`) | Empty (returns 404) |
 | `SERVICE_API_KEY` | Backend service key, the default usage ingest secret | Empty |
 | `GATEWAY_TLS_PORT` | TLS listener port (`off` disables it); plain HTTP stays on `80` | `8443` |

@@ -77,6 +77,15 @@ end
 -- Cache key prefix
 local CACHE_PREFIX_ROUTES = "routes:"
 
+-- Serve-stale (a second gateway on another host must outlive the backend): every answer is
+-- also kept under "stale:" for config.stale_ttl seconds, read only when the backend cannot
+-- answer (transport error or 5xx, never a 404). After a failure the backend is skipped for
+-- BACKEND_DOWN_HOLD seconds when it could not be reached at all (a 5xx is one name's
+-- problem), so requests don't each wait out the connect timeouts.
+local STALE_PREFIX = "stale:"
+local BACKEND_DOWN_KEY = "backend:down"
+local BACKEND_DOWN_HOLD = 30
+
 -- Retry settings for backend queries (handles transient DNS failures)
 -- DNS failures seem to recover within ~110ms based on logs, so use 150ms delay
 local BACKEND_MAX_RETRIES = 3
@@ -190,7 +199,7 @@ local function resolve_from_backend_v2(subdomain, req_id)
     local res, err
     for attempt = 1, BACKEND_MAX_RETRIES do
         local httpc = http.new()
-        httpc:set_timeout(5000)  -- 5 second timeout
+        httpc:set_timeouts(2000, 5000, 5000)  -- connect fast: a dead host must not stall requests
 
         res, err = httpc:request_uri(url, {
             method = "GET",
@@ -219,6 +228,10 @@ local function resolve_from_backend_v2(subdomain, req_id)
 
     ngx.log(ngx.INFO, "[", req_id, "] backend_query_done status=", res.status, " elapsed=", elapsed_ms(start_time), "ms")
 
+    if res.status >= 500 then
+        ngx.log(ngx.ERR, "[", req_id, "] backend_status_error status=", res.status, " subdomain=", subdomain)
+        return nil, "status_" .. res.status
+    end
     if res.status ~= 200 then
         ngx.log(ngx.WARN, "[", req_id, "] backend_status_error status=", res.status, " subdomain=", subdomain)
         return nil, "not_found"
@@ -242,7 +255,7 @@ local function resolve_from_backend_v1(subdomain, req_id)
     local res, err
     for attempt = 1, BACKEND_MAX_RETRIES do
         local httpc = http.new()
-        httpc:set_timeout(5000)
+        httpc:set_timeouts(2000, 5000, 5000)
 
         res, err = httpc:request_uri(url, {
             method = "GET",
@@ -317,17 +330,30 @@ do
     end
 end
 
--- The box's WireGuard address when this tunnel route can be served routed: the gateway
--- routes the tunnel subnet and the address the box registered lies inside it.
-local function routed_tunnel_ip(route)
+-- Whether a tunnel route's WireGuard address lies in the subnet this gateway routes.
+local function in_tunnel_subnet(route)
     if route.source ~= "tunnel" or not tunnel_base or type(route.tunnelIp) ~= "string" then
-        return nil
+        return false
     end
     local n = ipv4_to_int(route.tunnelIp)
-    if n and math.floor(n / tunnel_block) == tunnel_base then
+    return n ~= nil and math.floor(n / tunnel_block) == tunnel_base
+end
+
+-- The box's WireGuard address when this tunnel route can be served routed: the gateway
+-- routes the tunnel subnet, the address the box registered lies inside it, and the route
+-- takes HTTPS (the HTTP route carries tunnelIp only to name its provider).
+local function routed_tunnel_ip(route)
+    if (route.scheme or "https") == "https" and in_tunnel_subnet(route) then
         return route.tunnelIp
     end
     return nil
+end
+
+-- A tunnel route through another host's provider (several providers, one per gateway
+-- host): its address and WireGuard subnet mean nothing here, so it is never used.
+local function foreign_tunnel(route)
+    return route.source == "tunnel" and tunnel_base ~= nil and type(route.tunnelIp) == "string"
+        and not in_tunnel_subnet(route)
 end
 
 -- Protocol towards the box:
@@ -379,6 +405,15 @@ local function filter_routes_by_scheme(routes, required_scheme)
     if not routes or #routes == 0 then
         return routes
     end
+
+    -- Tunnel routes through another host's provider are not ours to use
+    local own = {}
+    for _, route in ipairs(routes) do
+        if not foreign_tunnel(route) then
+            table.insert(own, route)
+        end
+    end
+    routes = own
 
     -- If no scheme required, return all routes
     if not required_scheme or required_scheme == "" then
@@ -521,13 +556,36 @@ local function resolve()
     if not best_route then
         ngx.log(ngx.INFO, "[", req_id, "] cache_miss subdomain=", subdomain)
 
-        -- Query backend (try v2 first, fall back to v1)
-        local data, err = resolve_from_backend_v2(subdomain, req_id)
+        -- Query backend (try v2 first, fall back to v1 when v2 does not know the name),
+        -- unless it failed moments ago
+        local data, err
+        if cache and cache:get(BACKEND_DOWN_KEY) then
+            err = "backend_down_hold"
+        else
+            data, err = resolve_from_backend_v2(subdomain, req_id)
 
-        if not data then
-            -- Try v1 API as fallback
-            ngx.log(ngx.INFO, "[", req_id, "] trying_v1_fallback")
-            data, err = resolve_from_backend_v1(subdomain, req_id)
+            if not data and err == "not_found" then
+                -- Try v1 API as fallback
+                ngx.log(ngx.INFO, "[", req_id, "] trying_v1_fallback")
+                data, err = resolve_from_backend_v1(subdomain, req_id)
+            end
+
+            if not data and err ~= "not_found" and err ~= "no_ip" and err ~= "invalid_response"
+                and not err:find("^status_") and cache then
+                cache:set(BACKEND_DOWN_KEY, true, BACKEND_DOWN_HOLD)
+            end
+        end
+
+        -- Backend unreachable: the last answer it gave, if any
+        local stale = false
+        if not data and err ~= "not_found" and err ~= "no_ip" and cache and (config.stale_ttl or 0) > 0 then
+            local stale_json = cache:get(STALE_PREFIX .. "routes:" .. subdomain)
+            local stale_routes = stale_json and cjson.decode(stale_json)
+            if stale_routes then
+                ngx.log(ngx.WARN, "[", req_id, "] resolve_stale subdomain=", subdomain, " err=", err)
+                data = { routes = stale_routes, userId = cache:get(STALE_PREFIX .. "uid:" .. subdomain) }
+                stale = true
+            end
         end
 
         if not data then
@@ -576,8 +634,9 @@ local function resolve()
             " scheme=", protocol, " source=", best_route.source or "unknown",
             " priority=", best_route.priority or "nil")
 
-        -- Cache routes for future requests (cache raw routes, not selected)
-        if cache then
+        -- Cache routes for future requests (cache raw routes, not selected); a stale
+        -- answer is not re-cached, so the backend is asked again once it is back
+        if cache and not stale then
             local cache_ttl = config.cache_ttl or 60
             local routes_json = cjson.encode(routes)
             local ok, cache_err = cache:set("routes:" .. subdomain, routes_json, cache_ttl)
@@ -589,6 +648,12 @@ local function resolve()
             -- Cache uid alongside routes so cache-hit requests keep it for usage tracking.
             if data.userId and data.userId ~= "" then
                 cache:set("uid:" .. subdomain, data.userId, cache_ttl)
+            end
+            if (config.stale_ttl or 0) > 0 then
+                cache:set(STALE_PREFIX .. "routes:" .. subdomain, routes_json, config.stale_ttl)
+                if data.userId and data.userId ~= "" then
+                    cache:set(STALE_PREFIX .. "uid:" .. subdomain, data.userId, config.stale_ttl)
+                end
             end
         end
     end  -- end if not best_route

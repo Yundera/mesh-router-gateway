@@ -16,6 +16,9 @@ config.backend_url = "${BACKEND_URL}"
 -- Cache TTL in seconds
 config.cache_ttl = ${CACHE_TTL}
 
+-- Serve-stale: seconds a resolution is kept for when the backend cannot answer (0 = off)
+config.stale_ttl = ${RESOLVE_STALE_TTL}
+
 -- Static routing overrides (optional)
 config.override = {}
 

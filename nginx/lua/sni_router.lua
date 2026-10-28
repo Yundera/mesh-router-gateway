@@ -12,7 +12,9 @@
 
     Decision per user label, cached CACHE_TTL seconds in ngx.shared.sni_routes
     ("host:port" to pass through, "host:port pp" when the box takes a PROXY header,
-    "-" to terminate).
+    "-" to terminate). The decision is also kept STALE_TTL seconds under "stale:<label>" and
+    used while the backend cannot answer (transport error or 5xx), so a gateway on another
+    host keeps passing through when the backend's host is down.
 
     The front sends a PROXY v2 header on every connection (the client's address). A box
     that reported it takes one (`proxyProtocol` in /resolve/v2) gets it straight; any
@@ -27,6 +29,9 @@ local config = require "config"
 local _M = {}
 
 local CACHE_TTL = 60
+local STALE_TTL = tonumber(config.stale_ttl) or 0
+local BACKEND_DOWN_KEY = "backend:down"
+local BACKEND_DOWN_HOLD = 30
 local TERMINATE = "unix:/var/run/nginx-tls.sock"
 local STRIP = "unix:/var/run/nginx-strip.sock"
 
@@ -99,13 +104,16 @@ end
 
 local function lookup(label)
     local httpc = http.new()
-    httpc:set_timeout(2000)
+    httpc:set_timeouts(1000, 2000, 2000)
     local res, err = httpc:request_uri(config.backend_url .. "/resolve/v2/" .. label, { method = "GET" })
     if not res then
-        return nil, "backend: " .. (err or "?")
+        return nil, "backend: " .. (err or "?"), true
+    end
+    if res.status >= 500 then
+        return nil, "backend: status " .. res.status
     end
     if res.status ~= 200 then
-        return "-" -- not a user (404) or no answer: terminate
+        return "-" -- not a user (404): terminate
     end
     local data = cjson.decode(res.body)
     if not data then
@@ -133,12 +141,28 @@ local function decide()
     local target = cache:get(label)
     if not target then
         local err
-        target, err = lookup(label)
+        if cache:get(BACKEND_DOWN_KEY) then
+            err = "backend down (hold)"
+        else
+            local unreachable
+            target, err, unreachable = lookup(label)
+            if unreachable then
+                cache:set(BACKEND_DOWN_KEY, true, BACKEND_DOWN_HOLD)
+            end
+        end
         if not target then
+            local stale = STALE_TTL > 0 and cache:get("stale:" .. label)
+            if stale then
+                ngx.log(ngx.WARN, "sni_router: ", label, ": ", err, " (stale decision)")
+                return stale -- not re-cached: the next handshake asks again
+            end
             ngx.log(ngx.WARN, "sni_router: ", label, ": ", err, " (terminating)")
             return nil -- not cached: the next handshake asks again
         end
         cache:set(label, target, CACHE_TTL)
+        if STALE_TTL > 0 then
+            cache:set("stale:" .. label, target, STALE_TTL)
+        end
     end
     return target
 end

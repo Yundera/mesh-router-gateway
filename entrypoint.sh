@@ -7,6 +7,8 @@ echo "Starting mesh-router-gateway v${BUILD_VERSION:-dev}"
 export SERVER_DOMAIN="${SERVER_DOMAIN:-localhost}"
 export BACKEND_URL="${BACKEND_URL:-http://localhost:8192}"
 export CACHE_TTL="${CACHE_TTL:-60}"
+# Serve-stale: how long the last resolution is used while the backend cannot answer (0 = off)
+export RESOLVE_STALE_TTL="${RESOLVE_STALE_TTL:-86400}"
 # No default: empty = unknown names get a 404 (a fallback nothing listened on gave a 502).
 export DEFAULT_BACKEND="${DEFAULT_BACKEND:-}"
 # Usage (DAU) ingest: defaults to the backend's internal endpoint; secret = SERVICE_API_KEY.
@@ -22,7 +24,7 @@ GATEWAY_TLS_PROXY_PROTOCOL="${GATEWAY_TLS_PROXY_PROTOCOL:-0}"
 
 echo "  SERVER_DOMAIN: ${SERVER_DOMAIN}"
 echo "  BACKEND_URL: ${BACKEND_URL}"
-echo "  CACHE_TTL: ${CACHE_TTL}s"
+echo "  CACHE_TTL: ${CACHE_TTL}s (stale: ${RESOLVE_STALE_TTL}s)"
 echo "  USAGE_INGEST_URL: ${USAGE_INGEST_URL}"
 echo "  GATEWAY_TLS_PORT: ${GATEWAY_TLS_PORT} (proxy protocol: ${GATEWAY_TLS_PROXY_PROTOCOL})"
 
@@ -61,8 +63,12 @@ if [ ! -f "${CA_CERT_PATH}" ]; then
     exit 1
 fi
 
+# What Lua's HTTP client trusts: the public roots (an https BACKEND_URL, e.g. a gateway on
+# another host) and the mesh CA
+cat /etc/ssl/certs/ca-certificates.crt "${CA_CERT_PATH}" > /etc/ssl/certs/lua-trust.pem
+
 # Generate Lua config from template
-envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${DEFAULT_BACKEND} ${USAGE_INGEST_URL} ${USAGE_INGEST_SECRET} ${TUNNEL_SUBNET}' \
+envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${RESOLVE_STALE_TTL} ${DEFAULT_BACKEND} ${USAGE_INGEST_URL} ${USAGE_INGEST_SECRET} ${TUNNEL_SUBNET}' \
     < /etc/nginx/lua/config.lua.template \
     > /etc/nginx/lua/config.lua
 

@@ -43,7 +43,7 @@ You can benchmark at different layers to isolate latency:
 
 | Test Point | URL Pattern | What It Tests |
 |------------|-------------|---------------|
-| **A. CF Worker → nip.io** | `https://app-user.domain.com/` | CF Worker + nip.io direct to PCS (fastest) |
+| **A. CF Worker → ip.<zone>** | `https://app-user.domain.com/` | CF Worker direct to PCS via our nameserver (fastest) |
 | **B. CF Worker → Gateway** | Same URL + `X-Mesh-Force: gateway` | CF Worker + OpenResty gateway + PCS |
 | **C. Gateway Direct** | Gateway IP + `Host` header | OpenResty gateway only (bypasses CF Worker) |
 | **D. Caddy Direct** | `https://[pcs-ipv6]:10443/` + Host header | Caddy + TLS + container (bypasses gateway) |
@@ -52,9 +52,9 @@ You can benchmark at different layers to isolate latency:
 ### Example Test Endpoints
 
 ```bash
-# A. CF Worker → nip.io (default, fastest path)
-curl -H "X-Mesh-Trace: 1" https://admin-wisera.inojob.com/
-# Response: x-mesh-route: cf-worker,nip.io,direct,pcs
+# A. CF Worker → ip.<zone> (default, fastest path)
+curl -s -D- -o /dev/null -H "X-Mesh-Trace: 1" https://admin-wisera.inojob.com/ | grep -i x-mesh-route
+# Response: x-mesh-route: cf-worker,ip-dns,pcs
 
 # B. CF Worker → Gateway (force gateway fallback)
 curl -H "X-Mesh-Trace: 1" -H "X-Mesh-Force: gateway" https://admin-wisera.inojob.com/
@@ -175,7 +175,7 @@ Measured from external client to Scaleway Paris PCS:
 
 ### Routing Path Benchmarks
 
-Measured with `hey -n 100 -c 10` to inojob.com staging (Feb 2026):
+Measured with `hey -n 100 -c 10` to inojob.com staging (Feb 2026, before the ip.<zone> path: the direct path then went through nip.io):
 
 | Route Path | Avg Latency | Req/sec | X-Mesh-Route |
 |------------|-------------|---------|--------------|
@@ -184,14 +184,14 @@ Measured with `hey -n 100 -c 10` to inojob.com staging (Feb 2026):
 | Gateway → agent (direct) | ~445ms | 21 | `agent,pcs` |
 
 **Key findings:**
-- **nip.io direct path is ~4x faster** than gateway fallback (42ms vs 182ms)
+- **The direct path is ~4x faster** than gateway fallback (42ms vs 182ms)
 - Gateway adds significant latency when accessed from staging server (~445ms)
-- The nip.io path bypasses OpenResty entirely, going directly to PCS via Cloudflare
+- The direct path bypasses OpenResty entirely, going directly to PCS via Cloudflare
 
 **Benchmark commands:**
 
 ```bash
-# 1. CF Worker default path (nip.io direct)
+# 1. CF Worker default path (ip.<zone> direct)
 hey -n 100 -c 10 -H "X-Mesh-Trace: 1" "https://admin-wisera.inojob.com/"
 
 # 2. CF Worker with forced gateway fallback
@@ -224,13 +224,14 @@ Use the `X-Mesh-Trace` header to see the exact routing path taken:
 ```bash
 # Add X-Mesh-Trace header to see route path in response
 curl -s -D- -o /dev/null -H "X-Mesh-Trace: 1" https://admin-wisera.inojob.com/ | grep x-mesh-route
-# Output: x-mesh-route: cf-worker,nip.io,direct,pcs
+# Output: x-mesh-route: cf-worker,ip-dns,pcs
 ```
 
 The `X-Mesh-Route` response header shows the path taken:
 - `cf-worker` - Request went through Cloudflare Worker
-- `nip.io` - Used nip.io direct routing (not gateway fallback)
-- `gateway-fallback` - Used OpenResty gateway (when nip.io fails or forced)
+- `ip-dns` - Used the ip.<zone> direct path (not gateway fallback)
+- `ip-dns-fail` / `sslip.io` - ip.<zone> failed, retried on `<app>-<ip>.sslip.io`
+- `gateway-fallback` - Used OpenResty gateway (no usable direct route, or forced)
 - `direct` / `agent` - Route was from mesh-router-agent (direct IP)
 - `tunnel` - Route was from mesh-router-tunnel (WireGuard)
 - `pcs` - Final destination is Personal Cloud Server
@@ -240,7 +241,7 @@ The `X-Mesh-Route` response header shows the path taken:
 Use `X-Mesh-Force` header to force a specific routing path for testing:
 
 ```bash
-# Force gateway fallback (bypass nip.io direct path)
+# Force gateway fallback (bypass the direct paths)
 curl -H "X-Mesh-Force: gateway" https://admin-wisera.inojob.com/
 
 # Force direct (agent) route in gateway
@@ -252,7 +253,8 @@ curl -H "X-Mesh-Force: tunnel" -H "Host: admin-wisera.inojob.com" https://gatewa
 
 | X-Mesh-Force Value | Effect |
 |--------------------|--------|
-| `gateway` | CF Worker skips nip.io, uses gateway fallback |
+| `sslip` | CF Worker skips ip.<zone>, uses `<app>-<ip>.sslip.io` |
+| `gateway` | CF Worker skips the direct paths, uses gateway fallback |
 | `direct` | OpenResty gateway prefers route with source="agent" |
 | `tunnel` | OpenResty gateway prefers route with source="tunnel" |
 

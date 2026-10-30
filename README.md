@@ -109,7 +109,6 @@ This separation keeps the gateway simple and stateless.
 | `CACHE_TTL` | Resolution cache TTL in seconds | `60` |
 | `RESOLVE_STALE_TTL` | Serve-stale: how long the last resolution (HTTP routes and TLS passthrough decision) is kept for use while the backend cannot answer (timeout, refused, 5xx; never on a 404). An unreachable backend is then skipped for 30 s. `0` = off | `86400` |
 | `DEFAULT_BACKEND` | Fallback URL for unclaimed domains (e.g., `http://landing-page:80`) | Empty (returns 404) |
-| `SERVICE_API_KEY` | Backend service key, the default usage ingest secret | Empty |
 | `GATEWAY_TLS_PORT` | TLS listener port (`off` disables it); plain HTTP stays on `80` | `8443` |
 | `GATEWAY_TLS_PROXY_PROTOCOL` | `1` = the TLS listener expects PROXY protocol (behind a TCP passthrough) | `0` |
 | `GATEWAY_FORWARDED_FOR` | `append` keeps the client's X-Forwarded-For (Cloudflare's Worker puts the client there); `replace` sends only the address the gateway saw (set it once the gateway is the edge) | `append` |
@@ -182,7 +181,6 @@ services:
       - SERVER_DOMAIN=example.com
       - BACKEND_URL=http://resolution-backend:8192
       - CACHE_TTL=60
-      - SERVICE_API_KEY=${SERVICE_API_KEY}
       - GATEWAY_TLS_PORT=443
     restart: unless-stopped
 ```

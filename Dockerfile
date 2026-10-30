@@ -61,7 +61,6 @@ COPY nginx/gateway-common.conf /etc/nginx/gateway-common.conf
 
 # Copy Lua scripts to nginx lua dir
 COPY nginx/lua/resolver.lua /etc/nginx/lua/resolver.lua
-COPY nginx/lua/usage.lua /etc/nginx/lua/usage.lua
 COPY nginx/lua/sni_router.lua /etc/nginx/lua/sni_router.lua
 RUN mkdir -p /etc/nginx/stream.d
 COPY nginx/lua/config.lua.template /etc/nginx/lua/config.lua.template

@@ -11,11 +11,6 @@ export CACHE_TTL="${CACHE_TTL:-60}"
 export RESOLVE_STALE_TTL="${RESOLVE_STALE_TTL:-86400}"
 # No default: empty = unknown names get a 404 (a fallback nothing listened on gave a 502).
 export DEFAULT_BACKEND="${DEFAULT_BACKEND:-}"
-# Usage (DAU) ingest: defaults to the backend's internal endpoint; secret = SERVICE_API_KEY.
-# Leave USAGE_INGEST_URL empty (or unset with no BACKEND_URL) to disable usage notifications.
-export USAGE_INGEST_URL="${USAGE_INGEST_URL:-${BACKEND_URL}/internal/usage/ingest}"
-export USAGE_INGEST_SECRET="${USAGE_INGEST_SECRET:-${SERVICE_API_KEY:-}}"
-export SERVICE_API_KEY="${SERVICE_API_KEY:-}"
 # TLS listener (SNI router, see nginx/lua/sni_router.lua): 8443 behind a TCP
 # passthrough (GATEWAY_TLS_PROXY_PROTOCOL=1 carries the client address), 443 on a
 # host where the gateway is the edge, "off" to disable.
@@ -25,7 +20,6 @@ GATEWAY_TLS_PROXY_PROTOCOL="${GATEWAY_TLS_PROXY_PROTOCOL:-0}"
 echo "  SERVER_DOMAIN: ${SERVER_DOMAIN}"
 echo "  BACKEND_URL: ${BACKEND_URL}"
 echo "  CACHE_TTL: ${CACHE_TTL}s (stale: ${RESOLVE_STALE_TTL}s)"
-echo "  USAGE_INGEST_URL: ${USAGE_INGEST_URL}"
 echo "  GATEWAY_TLS_PORT: ${GATEWAY_TLS_PORT} (proxy protocol: ${GATEWAY_TLS_PROXY_PROTOCOL})"
 
 # Routed tunnel: the WireGuard subnet (TUNNEL_SUBNET) is reached through the tunnel
@@ -68,13 +62,12 @@ fi
 cat /etc/ssl/certs/ca-certificates.crt "${CA_CERT_PATH}" > /etc/ssl/certs/lua-trust.pem
 
 # Generate Lua config from template
-envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${RESOLVE_STALE_TTL} ${DEFAULT_BACKEND} ${USAGE_INGEST_URL} ${USAGE_INGEST_SECRET} ${TUNNEL_SUBNET}' \
+envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${RESOLVE_STALE_TTL} ${DEFAULT_BACKEND} ${TUNNEL_SUBNET}' \
     < /etc/nginx/lua/config.lua.template \
     > /etc/nginx/lua/config.lua
 
 echo "Config generated:"
-# Redact the usage ingest secret so it never lands in container logs.
-sed -e 's/\(usage_ingest_secret = "\)[^"]*\(".*\)/\1***REDACTED***\2/' /etc/nginx/lua/config.lua
+cat /etc/nginx/lua/config.lua
 
 # X-Forwarded-For towards the box. append (default): the client's own value is kept in
 # front of the address this gateway saw, which is how Cloudflare's Worker hands over the

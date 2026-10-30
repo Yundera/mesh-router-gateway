@@ -25,11 +25,6 @@ config.override = {}
 -- Default backend (used as fallback)
 config.default = "${DEFAULT_BACKEND}"
 
--- Usage (DAU) KPI ingest endpoint + bearer secret (= backend SERVICE_API_KEY).
--- Empty usage_ingest_url disables usage notifications.
-config.usage_ingest_url = "${USAGE_INGEST_URL}"
-config.usage_ingest_secret = "${USAGE_INGEST_SECRET}"
-
 -- Routed tunnel: WireGuard subnet this gateway routes to (empty = provider HTTP path only).
 config.tunnel_subnet = "${TUNNEL_SUBNET}"
 

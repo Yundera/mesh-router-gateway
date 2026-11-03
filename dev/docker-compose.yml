@@ -38,6 +38,9 @@ services:
     env_file:
       - path: .env
         required: false
+    volumes:
+      # GATEWAY_STATE_DIR: the mesh CA from the last good fetch, so a recreate works with the backend down
+      - gateway-state:/var/lib/mesh-gateway
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/_health"]
@@ -103,6 +106,9 @@ services:
     restart: unless-stopped
     profiles:
       - full-stack
+
+volumes:
+  gateway-state:
 
 networks:
   gateway-dev:

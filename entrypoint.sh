@@ -36,26 +36,51 @@ if [ -n "${TUNNEL_SUBNET}" ]; then
     fi
 fi
 
-# Fetch CA certificate from backend API
-echo "Fetching CA certificate from backend..."
-MAX_RETRIES=30
-RETRY_COUNT=0
+# Mesh CA (verifies the boxes' cert0 on the gateway → box hop): fetched from the backend,
+# kept in GATEWAY_STATE_DIR. Mount a volume there so a gateway *recreated* while the
+# backend is down still starts, on the copy from its last good fetch. Without a stored
+# copy the backend must answer (30 tries, 2 s apart); with one, 5 tries, then the copy.
+GATEWAY_STATE_DIR="${GATEWAY_STATE_DIR:-/var/lib/mesh-gateway}"
+mkdir -p "${GATEWAY_STATE_DIR}"
+CA_STORED="${GATEWAY_STATE_DIR}/mesh-ca.pem"
+CA_FETCHED="${GATEWAY_STATE_DIR}/.mesh-ca.pem.new"
 CA_CERT_PATH="/etc/ssl/certs/mesh-ca.pem"
 
+if [ -s "${CA_STORED}" ]; then
+    MAX_RETRIES=5
+else
+    MAX_RETRIES=30
+fi
+echo "Fetching CA certificate from backend..."
+RETRY_COUNT=0
+CA_FRESH=0
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    if curl -sf "${BACKEND_URL}/ca-cert" -o "${CA_CERT_PATH}"; then
-        echo "CA certificate fetched successfully"
+    # into a temp file, accepted only if it parses as a certificate: an interrupted
+    # download or an error page never replaces the stored copy
+    # --connect-timeout bounds the name lookup too (a stopped backend container is an
+    # unknown name on the Docker network, which hangs rather than failing)
+    if curl -sf --connect-timeout 3 --max-time 10 "${BACKEND_URL}/ca-cert" -o "${CA_FETCHED}" \
+        && openssl x509 -noout -in "${CA_FETCHED}" 2>/dev/null; then
+        mv -f "${CA_FETCHED}" "${CA_STORED}"
+        CA_FRESH=1
+        echo "CA certificate fetched successfully (stored in ${CA_STORED})"
         break
     fi
+    rm -f "${CA_FETCHED}"
     RETRY_COUNT=$((RETRY_COUNT + 1))
-    echo "Backend not ready, retrying in 2s... ($RETRY_COUNT/$MAX_RETRIES)"
+    echo "No valid CA certificate from the backend yet, retrying in 2s... ($RETRY_COUNT/$MAX_RETRIES)"
     sleep 2
 done
 
-if [ ! -f "${CA_CERT_PATH}" ]; then
-    echo "ERROR: Could not fetch CA certificate after $MAX_RETRIES attempts"
-    exit 1
+if [ "${CA_FRESH}" != "1" ]; then
+    if openssl x509 -noout -in "${CA_STORED}" 2>/dev/null; then
+        echo "WARNING: no valid CA certificate from the backend, starting on the stored copy (${CA_STORED}, $(date -r "${CA_STORED}" -u '+%Y-%m-%dT%H:%MZ' 2>/dev/null || echo 'date unknown'))"
+    else
+        echo "ERROR: no valid CA certificate from the backend after $MAX_RETRIES attempts, and no stored copy in ${GATEWAY_STATE_DIR} (mount a volume there)"
+        exit 1
+    fi
 fi
+cp "${CA_STORED}" "${CA_CERT_PATH}"
 
 # What Lua's HTTP client trusts: the public roots (an https BACKEND_URL, e.g. a gateway on
 # another host) and the mesh CA

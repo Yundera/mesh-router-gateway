@@ -113,6 +113,21 @@ This separation keeps the gateway simple and stateless.
 | `GATEWAY_TLS_PROXY_PROTOCOL` | `1` = the TLS listener expects PROXY protocol (behind a TCP passthrough) | `0` |
 | `GATEWAY_FORWARDED_FOR` | `append` keeps the client's X-Forwarded-For (Cloudflare's Worker puts the client there); `replace` sends only the address the gateway saw (set it once the gateway is the edge) | `append` |
 | `GATEWAY_TLS_REALIP_FROM` | Sources whose PROXY header gives the client address (with `GATEWAY_TLS_PROXY_PROTOCOL=1`), space-separated CIDRs | private ranges |
+| `GATEWAY_STATE_DIR` | Where the gateway keeps state that must survive a recreate: the mesh CA from its last good fetch. **Mount a volume here** (see below) | `/var/lib/mesh-gateway` |
+
+### Mesh CA and the state volume
+
+At start the gateway fetches the mesh CA (`GET <BACKEND_URL>/ca-cert`), which verifies the
+boxes' cert0 on the gateway → box hop. A good fetch (it must parse as a certificate) is
+stored in `GATEWAY_STATE_DIR`. On the next start, if the backend cannot answer within
+5 tries (~10 s), the gateway starts on that stored copy and logs a warning. With no stored
+copy it waits for the backend (30 tries, ~60 s) and then exits, as before.
+
+So mount a volume on `GATEWAY_STATE_DIR`: without it, a gateway **recreated** (new image,
+changed env) while the backend is down cannot start. With serve-stale
+(`RESOLVE_STALE_TTL`) the volume is what lets a gateway on another host keep serving through
+a backend outage, restart included. The CA is refreshed on every start that reaches the
+backend.
 
 ### TLS
 
@@ -182,7 +197,12 @@ services:
       - BACKEND_URL=http://resolution-backend:8192
       - CACHE_TTL=60
       - GATEWAY_TLS_PORT=443
+    volumes:
+      - gateway-state:/var/lib/mesh-gateway   # mesh CA kept across recreates
     restart: unless-stopped
+
+volumes:
+  gateway-state:
 ```
 
 ## DNS Resolver Configuration (Important!)

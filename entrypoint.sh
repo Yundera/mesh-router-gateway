@@ -106,12 +106,70 @@ if [ "${GATEWAY_FORWARDED_FOR}" = "replace" ]; then
 else
     FORWARDED_FOR_VALUE='$proxy_add_x_forwarded_for'
 fi
+# A request another gateway handed over ($mesh_handoff_in, resolver.lua, only from a known
+# gateway) keeps the client that gateway saw: its X-Real-IP, and its X-Forwarded-For with
+# that gateway appended (boxes trust every gateway, so they read past it to the client).
 cat > /etc/nginx/conf.d/00-forwarded-for.conf <<EOF
-map \$remote_addr \$mesh_forwarded_for {
+map \$mesh_handoff_in \$mesh_forwarded_for {
     default ${FORWARDED_FOR_VALUE};
+    "1" \$proxy_add_x_forwarded_for;
+}
+map \$mesh_handoff_in \$mesh_real_ip {
+    default \$remote_addr;
+    "1" \$http_x_real_ip;
 }
 EOF
 echo "  X-Forwarded-For: ${GATEWAY_FORWARDED_FOR}"
+
+# Gateway certificate (handoff between gateways, docs/multi-gateway.md in
+# mesh-router-nameserver): signed by the mesh CA for <ip-dashed>.gw.<zone>, which another
+# gateway verifies when it hands this one a request for a box it cannot reach. Needs
+# GATEWAY_PUBLIC_IP (this gateway's address, one of the backend's DNS_GATEWAY_IPS) and
+# GATEWAY_CERT_TOKEN (the backend's). Key and certificate live in GATEWAY_STATE_DIR, so a
+# restart while the backend is down keeps the last one; renewed when 10 days are left.
+GATEWAY_PUBLIC_IP="${GATEWAY_PUBLIC_IP:-}"
+GATEWAY_CERT_TOKEN="${GATEWAY_CERT_TOKEN:-}"
+GW_KEY="${GATEWAY_STATE_DIR}/gateway.key"
+GW_CERT="${GATEWAY_STATE_DIR}/gateway.crt"
+GW_NAME=""
+if [ -n "${GATEWAY_PUBLIC_IP}" ]; then
+    GW_NAME="$(echo "${GATEWAY_PUBLIC_IP}" | tr . -).gw.$(echo "${SERVER_DOMAIN}" | tr 'A-Z' 'a-z')"
+fi
+
+# Writes a fresh certificate into GW_CERT; 0 on success.
+gateway_cert_fetch() {
+    [ -s "${GW_KEY}" ] || openssl genrsa -out "${GW_KEY}" 2048 2>/dev/null || return 1
+    chmod 600 "${GW_KEY}"
+    openssl req -new -key "${GW_KEY}" -subj "/CN=${GW_NAME}" -out "${GATEWAY_STATE_DIR}/gateway.csr" 2>/dev/null || return 1
+    curl -sf --connect-timeout 3 --max-time 15 -X POST \
+        -H "Authorization: Bearer ${GATEWAY_CERT_TOKEN}" -H "Content-Type: text/plain" \
+        --data-binary "@${GATEWAY_STATE_DIR}/gateway.csr" \
+        "${BACKEND_URL}/gateway-cert/${GATEWAY_PUBLIC_IP}" -o "${GW_CERT}.new" \
+        && openssl x509 -noout -in "${GW_CERT}.new" 2>/dev/null \
+        && mv -f "${GW_CERT}.new" "${GW_CERT}" && return 0
+    rm -f "${GW_CERT}.new"
+    return 1
+}
+
+# 0 when GW_CERT exists and is valid for at least $1 more seconds.
+gateway_cert_valid() {
+    [ -s "${GW_CERT}" ] && openssl x509 -noout -checkend "$1" -in "${GW_CERT}" >/dev/null 2>&1
+}
+
+GW_CERT_READY=0
+if [ -n "${GW_NAME}" ] && [ -n "${GATEWAY_CERT_TOKEN}" ] && [ "${GATEWAY_TLS_PORT}" != "off" ]; then
+    if gateway_cert_valid 864000 || gateway_cert_fetch; then
+        GW_CERT_READY=1
+        echo "  Gateway certificate: ${GW_NAME} (handoff), until $(openssl x509 -noout -enddate -in "${GW_CERT}" | cut -d= -f2)"
+    elif gateway_cert_valid 0; then
+        GW_CERT_READY=1
+        echo "WARNING: gateway certificate not renewed (backend?), using the stored one until $(openssl x509 -noout -enddate -in "${GW_CERT}" | cut -d= -f2)"
+    else
+        echo "WARNING: no gateway certificate (backend refused or unreachable): other gateways cannot hand requests to this one"
+    fi
+else
+    echo "  Gateway certificate: off (GATEWAY_PUBLIC_IP / GATEWAY_CERT_TOKEN unset): this gateway hands requests over but takes none"
+fi
 
 # TLS front + TLS server.
 # The front (stream, sni_router.lua) listens on GATEWAY_TLS_PORT and passes a user's dot
@@ -205,12 +263,49 @@ server {
     include /etc/nginx/gateway-common.conf;
 }
 EOF
+    # Handoff from another gateway: the same server under this gateway's own certificate,
+    # picked by SNI <ip-dashed>.gw.<zone> (the front terminates it: `gw` is reserved)
+    if [ "${GW_CERT_READY}" = "1" ]; then
+        cat >> "${TLS_CONF}" <<EOF
+
+server {
+    listen unix:${TLS_SOCKET} ssl proxy_protocol;
+    http2 on;
+    server_name ${GW_NAME};
+    set_real_ip_from unix:;
+    real_ip_header proxy_protocol;
+
+    ssl_certificate ${GW_CERT};
+    ssl_certificate_key ${GW_KEY};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:gateway_tls:10m;
+
+    include /etc/nginx/gateway-common.conf;
+}
+EOF
+    fi
 fi
 
 # Create log files
 mkdir -p /var/log/nginx
 touch /var/log/nginx/access.log
 touch /var/log/nginx/error.log
+
+# Gateway certificate renewal: twice a day, a new one once 10 days are left, then a reload
+if [ "${GW_CERT_READY}" = "1" ]; then
+    (
+        while sleep 43200; do
+            if ! gateway_cert_valid 864000; then
+                if gateway_cert_fetch; then
+                    echo "Gateway certificate renewed, until $(openssl x509 -noout -enddate -in "${GW_CERT}" | cut -d= -f2)"
+                    openresty -s reload
+                else
+                    echo "WARNING: gateway certificate renewal failed, retrying in 12 h"
+                fi
+            fi
+        done
+    ) &
+fi
 
 # Start OpenResty (nginx) in foreground
 exec openresty -g 'daemon off;'

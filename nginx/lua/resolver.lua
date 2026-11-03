@@ -23,7 +23,9 @@
 
     Route Selection:
     - Routes sorted by priority (lower = better)
-    - Best route selected (no failover - routes validated at registration)
+    - Best route selected; when it is our own tunnel and the box cannot be reached, or
+      when the box is reached only through another host's provider, the gateway next to
+      that provider takes the request (handoff.lua)
 
     Default Backend Fallback:
     - If config.default is set, unclaimed domains route to landing page
@@ -316,6 +318,67 @@ local function foreign_tunnel(route)
         and not in_tunnel_subnet(route)
 end
 
+-- Handoff (handoff.lua): the gateway that reaches a box through its own provider, from
+-- the `gateway` tag the backend puts on each tunnel route (backend 2.0.58+). Only for a
+-- request no gateway has handed over yet: a handed-over request is never handed on.
+local IPV4 = "^%d+%.%d+%.%d+%.%d+$"
+local GATEWAY_IPS_KEY = "gateway_ips"
+
+local function handoff_claimed()
+    return ngx.var.http_x_mesh_handoff ~= nil
+end
+
+local function handoff_peer(routes)
+    if not routes or handoff_claimed() then
+        return nil
+    end
+    for _, route in ipairs(routes) do
+        if foreign_tunnel(route) and type(route.gateway) == "string" and route.gateway:match(IPV4) then
+            return route.gateway
+        end
+    end
+    return nil
+end
+
+-- The name the other gateway's mesh certificate carries (backend gatewayCertName).
+local function gateway_cert_name(ip)
+    return (ip:gsub("%.", "-")) .. ".gw." .. (config.server_domain or ""):lower()
+end
+
+local function set_handoff_peer(peer)
+    ngx.var.mesh_handoff_peer = "https://" .. peer .. ":443"
+    ngx.var.mesh_handoff_sni = gateway_cert_name(peer)
+end
+
+-- A handed-over request is believed (client address in X-Real-IP / X-Forwarded-For) only
+-- from one of the gateways (`gatewayIps` of /resolve/v2, kept from the last answer).
+local function trusted_gateway(addr)
+    local cache = get_cache()
+    local list = cache and cjson.decode(cache:get(GATEWAY_IPS_KEY) or "null")
+    if type(list) ~= "table" then
+        return false
+    end
+    for _, ip in ipairs(list) do
+        if ip == addr then
+            return true
+        end
+    end
+    return false
+end
+
+local function set_websocket_vars(req_id, backend_url)
+    -- CF Worker sends X-Mesh-WebSocket but not the actual Upgrade header
+    -- For HTTP requests, set empty strings (preserves default behavior)
+    if is_websocket_request() then
+        ngx.var.ws_upgrade = ngx.var.http_upgrade or "websocket"
+        ngx.var.ws_connection = "upgrade"
+        ngx.log(ngx.INFO, "[", req_id, "] websocket_request backend=", backend_url)
+    else
+        ngx.var.ws_upgrade = ""
+        ngx.var.ws_connection = ""
+    end
+end
+
 -- Protocol towards the box:
 -- - routed tunnel: HTTPS to the box's Caddy through WireGuard (TLS ends on the box)
 -- - provider tunnel: HTTP (the provider's nginx only speaks HTTP, TLS ended here)
@@ -489,6 +552,8 @@ local function resolve()
 
     -- Check cache for routes data (JSON string)
     local best_route = nil
+    local all_routes = nil   -- every route of the box, ours or not (handoff)
+    local peer = nil         -- the gateway to hand over to when we have no route of our own
     local cached_routes_json = nil
     if cache then
         cached_routes_json = cache:get("routes:" .. subdomain)
@@ -497,14 +562,18 @@ local function resolve()
             if cached_routes and #cached_routes > 0 then
                 ngx.log(ngx.INFO, "[", req_id, "] cache_hit subdomain=", subdomain, " routes_count=", #cached_routes, " elapsed=", elapsed_ms(start_time), "ms")
                 -- Select best route by priority
+                all_routes = cached_routes
                 best_route = select_best_route(filter_routes_by_scheme(cached_routes, original_scheme), req_id)
+                if not best_route then
+                    peer = handoff_peer(cached_routes)
+                end
                 -- Continue to WebSocket check below (don't return early)
             end
         end
     end
 
     -- Only fetch from backend if no cache hit
-    if not best_route then
+    if not best_route and not peer then
         ngx.log(ngx.INFO, "[", req_id, "] cache_miss subdomain=", subdomain)
 
         -- Query backend (try v2 first, fall back to v1 when v2 does not know the name),
@@ -566,21 +635,28 @@ local function resolve()
 
         ngx.log(ngx.INFO, "[", req_id, "] routes_found count=", #routes)
 
+        -- The gateways (whose handed-over requests to believe), kept as long as a stale answer
+        if cache and not stale and type(data.gatewayIps) == "table" then
+            cache:set(GATEWAY_IPS_KEY, cjson.encode(data.gatewayIps))
+        end
+
         -- Select best route by priority among those matching the request scheme
+        all_routes = routes
         best_route = select_best_route(filter_routes_by_scheme(routes, original_scheme), req_id)
 
         if not best_route then
-            ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_route_selected subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
-            ngx.exit(ngx.HTTP_BAD_GATEWAY)
-            return
+            peer = handoff_peer(routes)
+            if not peer then
+                ngx.log(ngx.ERR, "[", req_id, "] resolve_error reason=no_route_selected subdomain=", subdomain, " elapsed=", elapsed_ms(start_time), "ms")
+                ngx.exit(ngx.HTTP_BAD_GATEWAY)
+                return
+            end
+        else
+            -- Log selected route for debugging
+            ngx.log(ngx.INFO, "[", req_id, "] route_selected ip=", best_route.ip, " port=", best_route.port or 443,
+                " scheme=", route_protocol(best_route), " source=", best_route.source or "unknown",
+                " priority=", best_route.priority or "nil")
         end
-
-        -- Log selected route for debugging
-        local protocol = route_protocol(best_route)
-
-        ngx.log(ngx.INFO, "[", req_id, "] route_selected ip=", best_route.ip, " port=", best_route.port or 443,
-            " scheme=", protocol, " source=", best_route.source or "unknown",
-            " priority=", best_route.priority or "nil")
 
         -- Cache routes for future requests (cache raw routes, not selected); a stale
         -- answer is not re-cached, so the backend is asked again once it is back
@@ -604,6 +680,33 @@ local function resolve()
     -- Set request ID header for correlation in logs
     ngx.req.set_header("X-Request-ID", req_id)
 
+    -- Proxy host for downstream routing (Caddy needs original Host header)
+    -- CF Worker mode: use X-Mesh-Route-Host header; direct mode: use original Host header
+    ngx.var.proxy_host = ngx.var.http_x_mesh_route_host or host
+
+    -- Handed over by another gateway: believe the client address it passes on
+    if handoff_claimed() and trusted_gateway(ngx.var.remote_addr) then
+        ngx.var.mesh_handoff_in = "1"
+    end
+
+    -- No route of our own: the gateway whose provider reaches the box takes it
+    if not best_route then
+        set_handoff_peer(peer)
+        ngx.var.mesh_handoff_mode = "direct"
+        set_websocket_vars(req_id, ngx.var.mesh_handoff_peer)
+        ngx.log(ngx.INFO, "[", req_id, "] handoff subdomain=", subdomain, " peer=", peer)
+        return ngx.exec("@mesh_handoff")
+    end
+
+    -- Our route goes through our own tunnel: if the box cannot be reached that way, the
+    -- gateway reaching it through its own provider is the retry (error_page, handoff.lua)
+    if best_route.source == "tunnel" then
+        local retry_peer = handoff_peer(all_routes)
+        if retry_peer then
+            set_handoff_peer(retry_peer)
+        end
+    end
+
     -- Build backend URL from selected route
     local backend_url = build_backend_url_from_route(best_route)
 
@@ -616,11 +719,6 @@ local function resolve()
     -- Set nginx variables for proxy_pass
     ngx.var.backend = backend_url
 
-    -- Set proxy host for downstream routing (Caddy needs original Host header)
-    -- CF Worker mode: use X-Mesh-Route-Host header
-    -- Direct mode: use original Host header
-    ngx.var.proxy_host = ngx.var.http_x_mesh_route_host or host
-
     -- SNI on HTTPS backends: the box's hop name <label>.box.<zone>, which its cert0 (mesh
     -- CA, the only CA trusted on this hop) carries. The connection is verified against
     -- that box, whatever IP or tunnel it goes through.
@@ -629,16 +727,7 @@ local function resolve()
     end
 
     -- Set WebSocket upgrade headers if this is a WebSocket request
-    -- CF Worker sends X-Mesh-WebSocket but not the actual Upgrade header
-    -- For HTTP requests, set empty strings (preserves default behavior)
-    if is_websocket_request() then
-        ngx.var.ws_upgrade = ngx.var.http_upgrade or "websocket"
-        ngx.var.ws_connection = "upgrade"
-        ngx.log(ngx.INFO, "[", req_id, "] websocket_request backend=", backend_url)
-    else
-        ngx.var.ws_upgrade = ""
-        ngx.var.ws_connection = ""
-    end
+    set_websocket_vars(req_id, backend_url)
 
     -- Set mesh route for tracing
     local trace_enabled = ngx.var.http_x_mesh_trace ~= nil

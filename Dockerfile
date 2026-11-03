@@ -58,10 +58,13 @@ RUN rm -f /etc/nginx/conf.d/default.conf
 # Copy gateway configuration
 COPY nginx/gateway.conf /etc/nginx/conf.d/gateway.conf
 COPY nginx/gateway-common.conf /etc/nginx/gateway-common.conf
+COPY nginx/gateway-proxy.conf /etc/nginx/gateway-proxy.conf
 
 # Copy Lua scripts to nginx lua dir
 COPY nginx/lua/resolver.lua /etc/nginx/lua/resolver.lua
 COPY nginx/lua/sni_router.lua /etc/nginx/lua/sni_router.lua
+COPY nginx/lua/handoff.lua /etc/nginx/lua/handoff.lua
+COPY nginx/lua/request_log.lua /etc/nginx/lua/request_log.lua
 RUN mkdir -p /etc/nginx/stream.d
 COPY nginx/lua/config.lua.template /etc/nginx/lua/config.lua.template
 

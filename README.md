@@ -113,7 +113,9 @@ This separation keeps the gateway simple and stateless.
 | `GATEWAY_TLS_PROXY_PROTOCOL` | `1` = the TLS listener expects PROXY protocol (behind a TCP passthrough) | `0` |
 | `GATEWAY_FORWARDED_FOR` | `append` keeps the client's X-Forwarded-For (Cloudflare's Worker puts the client there); `replace` sends only the address the gateway saw (set it once the gateway is the edge) | `append` |
 | `GATEWAY_TLS_REALIP_FROM` | Sources whose PROXY header gives the client address (with `GATEWAY_TLS_PROXY_PROTOCOL=1`), space-separated CIDRs | private ranges |
-| `GATEWAY_STATE_DIR` | Where the gateway keeps state that must survive a recreate: the mesh CA from its last good fetch. **Mount a volume here** (see below) | `/var/lib/mesh-gateway` |
+| `GATEWAY_STATE_DIR` | Where the gateway keeps state that must survive a recreate: the mesh CA from its last good fetch, and its gateway certificate. **Mount a volume here** (see below) | `/var/lib/mesh-gateway` |
+| `GATEWAY_PUBLIC_IP` | This gateway's public IPv4, one of the backend's `DNS_GATEWAY_IPS`: names its gateway certificate (handoff, below) | Empty (takes no handoff) |
+| `GATEWAY_CERT_TOKEN` | The backend's `GATEWAY_CERT_TOKEN`, to get the gateway certificate | Empty (takes no handoff) |
 
 ### Mesh CA and the state volume
 
@@ -128,6 +130,35 @@ changed env) while the backend is down cannot start. With serve-stale
 (`RESOLVE_STALE_TTL`) the volume is what lets a gateway on another host keep serving through
 a backend outage, restart included. The CA is refreshed on every start that reaches the
 backend.
+
+### Handoff between gateways
+
+With several gateways, each reaches NAT boxes only through the tunnel provider on its own
+host (`TUNNEL_SUBNET`), while DNS answers a dash name (`<app>-<user>.<zone>`) with every
+healthy gateway. Backend 2.0.58+ tags each tunnel route with the gateway whose provider
+holds it (`gateway`) and drops the routes of a provider that is down. A gateway then hands
+a request to the gateway that reaches the box:
+
+- **directly**, when it has no route of its own to the box (only routes through another
+  host's provider): `x-mesh-route: handoff,…`;
+- **as a retry**, when its own tunnel route fails to connect (provider down before the
+  backend notices, or within `CACHE_TTL`): `x-mesh-route: retry,handoff,…`. Only when the
+  connection never opened, so the box cannot have seen the request; the request body is
+  sent again. A failure after connecting stays an error.
+
+The hop is HTTPS to `<peer ip>:443`, SNI `<ip-dashed>.gw.<zone>`, verified against the mesh
+CA: the receiving gateway presents its **gateway certificate**, which the backend signs
+(`POST /gateway-cert/<ip>`, `GATEWAY_CERT_TOKEN`) for that name only. `gw` is a reserved
+label, so no box can hold such a certificate, and the TLS front terminates the name. The
+key and certificate (RSA, 30 days) are kept in `GATEWAY_STATE_DIR`, renewed when 10 days
+are left (checked twice a day, then a reload), and used as they are while the backend is
+down. Without `GATEWAY_PUBLIC_IP` and `GATEWAY_CERT_TOKEN` a gateway still hands requests
+over but takes none.
+
+The request carries `X-Mesh-Handoff: 1`; the receiving gateway never hands it on, and,
+when the sender is one of the gateways (`gatewayIps` of `/resolve/v2`), keeps the client
+address it passed on (`X-Real-IP`, and its `X-Forwarded-For` plus the sender, which boxes
+trust as a gateway). The header never reaches a box.
 
 ### TLS
 
@@ -307,9 +338,13 @@ mesh-router-gateway/
 ├── nginx/
 │   ├── nginx.conf              # Main Nginx configuration
 │   ├── gateway.conf            # Server block for gateway
+│   ├── gateway-common.conf     # Locations: / and @mesh_handoff
+│   ├── gateway-proxy.conf      # The proxy hop, shared by both locations
 │   └── lua/
 │       ├── resolver.lua        # Domain resolution logic
-│       └── cache.lua           # Resolution caching
+│       ├── handoff.lua         # Handoff to another gateway (direct or retry)
+│       ├── request_log.lua     # Final status log line
+│       └── sni_router.lua      # TLS front: pass through or terminate
 ├── src/                        # (Optional) Node.js health/metrics
 │   └── index.ts
 ├── Dockerfile

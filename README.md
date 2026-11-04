@@ -116,6 +116,11 @@ This separation keeps the gateway simple and stateless.
 | `GATEWAY_STATE_DIR` | Where the gateway keeps state that must survive a recreate: the mesh CA from its last good fetch, and its gateway certificate. **Mount a volume here** (see below) | `/var/lib/mesh-gateway` |
 | `GATEWAY_PUBLIC_IP` | This gateway's public IPv4, one of the backend's `DNS_GATEWAY_IPS`: names its gateway certificate (handoff, below) | Empty (takes no handoff) |
 | `GATEWAY_CERT_TOKEN` | The backend's `GATEWAY_CERT_TOKEN`, to get the gateway certificate | Empty (takes no handoff) |
+| `GATEWAY_ACME_DNS` | lego DNS provider for this gateway's public `*.<SERVER_DOMAIN>` certificate (see below): `cloudflare` while Cloudflare holds the zone, `acme-dns` once our nameservers do | Empty (self-signed fallback) |
+| `GATEWAY_ACME_SERVER` | ACME directory. Let's Encrypt staging for tests: `https://acme-staging-v02.api.letsencrypt.org/directory` | Let's Encrypt production |
+| `GATEWAY_ACME_EMAIL` | ACME account contact (lego requires one) | `admin@<SERVER_DOMAIN>` |
+| `GATEWAY_ACME_RENEW_DAYS` | Renew when fewer days than this are left | `30` |
+| `CLOUDFLARE_DNS_API_TOKEN` | With `GATEWAY_ACME_DNS=cloudflare`: a token with DNS edit on this zone only, IP-filtered to the gateways | — |
 
 ### Mesh CA and the state volume
 
@@ -130,6 +135,23 @@ changed env) while the backend is down cannot start. With serve-stale
 (`RESOLVE_STALE_TTL`) the volume is what lets a gateway on another host keep serving through
 a backend outage, restart included. The CA is refreshed on every start that reaches the
 backend.
+
+### Public certificate `*.<zone>`
+
+With `GATEWAY_ACME_DNS` set, each gateway orders its own Let's Encrypt `*.<SERVER_DOMAIN>`
+by DNS-01 with [lego](https://go-acme.github.io/lego/) (in the image): its own ACME account
+and key, kept in `GATEWAY_STATE_DIR/acme/<CA host>/`. The HTTP TLS server presents it for
+every name it terminates; the handoff name keeps its mesh CA certificate, and dot names /
+apexes passed through to boxes are untouched. The gateway never waits for an order: it
+starts on the stored certificate (or the self-signed fallback), orders in the background
+10 s after start, and swaps a new certificate in with an nginx reload. Checked twice a
+day; hourly while there is no valid certificate. Cutoff gate G6 in
+`mesh-router-nameserver/docs/cutoff-runbook.md`; design in `phase-1.1-gateway-tls.md` §6.
+
+Before the NS switch the challenge TXT is written through Cloudflare's API
+(`GATEWAY_ACME_DNS=cloudflare` + `CLOUDFLARE_DNS_API_TOKEN`); at the switch, change the
+provider to `acme-dns` (lego's `ACME_DNS_API_BASE`, `ACME_DNS_STORAGE_PATH`) and delete the
+token. The certificate already issued keeps serving.
 
 ### Handoff between gateways
 

@@ -116,7 +116,7 @@ This separation keeps the gateway simple and stateless.
 | `GATEWAY_STATE_DIR` | Where the gateway keeps state that must survive a recreate: the mesh CA from its last good fetch, and its gateway certificate. **Mount a volume here** (see below) | `/var/lib/mesh-gateway` |
 | `GATEWAY_PUBLIC_IP` | This gateway's public IPv4, one of the backend's `DNS_GATEWAY_IPS`: names its gateway certificate (handoff, below) | Empty (takes no handoff) |
 | `GATEWAY_CERT_TOKEN` | The backend's `GATEWAY_CERT_TOKEN`, to get the gateway certificate | Empty (takes no handoff) |
-| `GATEWAY_ACME_DNS` | lego DNS provider for this gateway's public `*.<SERVER_DOMAIN>` certificate (see below): `cloudflare` while Cloudflare holds the zone, `acme-dns` once our nameservers do | Empty (self-signed fallback) |
+| `GATEWAY_ACME_DNS` | DNS provider for this gateway's public `*.<SERVER_DOMAIN>` certificate (see below): `cloudflare` while Cloudflare holds the zone, `mesh` once our nameservers do (the backend's `/acme-dns`, with `GATEWAY_CERT_TOKEN`), or any lego provider | Empty (self-signed fallback) |
 | `GATEWAY_ACME_SERVER` | ACME directory. Let's Encrypt staging for tests: `https://acme-staging-v02.api.letsencrypt.org/directory` | Let's Encrypt production |
 | `GATEWAY_ACME_EMAIL` | ACME account contact (lego requires one) | `admin@<SERVER_DOMAIN>` |
 | `GATEWAY_ACME_RENEW_DAYS` | Renew when fewer days than this are left | `30` |
@@ -149,9 +149,13 @@ day; hourly while there is no valid certificate. Cutoff gate G6 in
 `mesh-router-nameserver/docs/cutoff-runbook.md`; design in `phase-1.1-gateway-tls.md` §6.
 
 Before the NS switch the challenge TXT is written through Cloudflare's API
-(`GATEWAY_ACME_DNS=cloudflare` + `CLOUDFLARE_DNS_API_TOKEN`); at the switch, change the
-provider to `acme-dns` (lego's `ACME_DNS_API_BASE`, `ACME_DNS_STORAGE_PATH`) and delete the
-token. The certificate already issued keeps serving.
+(`GATEWAY_ACME_DNS=cloudflare` + `CLOUDFLARE_DNS_API_TOKEN`); at the switch, set
+`GATEWAY_ACME_DNS=mesh` and delete the token. `mesh` is lego's httpreq provider against
+the backend (`BACKEND_URL/acme-dns/present|cleanup`), authenticated with the gateway's
+`GATEWAY_CERT_TOKEN` (already there for the handoff certificate), which may write
+`_acme-challenge.<zone>` in the apex zone and nothing else; the backend needs
+`DNS_STATIC_ZONE_FILE` (the apex zone is ours). The certificate already issued keeps
+serving, so the switch needs no order at all; the next renewal goes through our nameservers.
 
 ### Handoff between gateways
 

@@ -317,8 +317,10 @@ fi
 # HTTP TLS server presents it for every name it terminates; the handoff name keeps its
 # mesh CA certificate. GATEWAY_ACME_DNS is lego's DNS provider: "cloudflare" while
 # Cloudflare holds the zone (CLOUDFLARE_DNS_API_TOKEN, DNS edit on this zone only),
-# "acme-dns" once our nameservers do (ACME_DNS_API_BASE, ACME_DNS_STORAGE_PATH). Empty =
-# off: the self-signed fallback, as before. The gateway never waits for an order: it
+# "mesh" once our nameservers do: lego's httpreq against the backend (BACKEND_URL
+# /acme-dns/present|cleanup) with this gateway's GATEWAY_CERT_TOKEN, which writes
+# _acme-challenge.<zone> into the apex zone. Any other lego provider name works too,
+# with that provider's own variables. Empty = off: the self-signed fallback, as before. The gateway never waits for an order: it
 # starts on the stored certificate or the fallback, and swaps in a new one with a reload.
 GATEWAY_ACME_DNS="${GATEWAY_ACME_DNS:-}"
 # the ACME account's contact (lego requires one): an alias of the zone by default
@@ -328,6 +330,20 @@ GATEWAY_ACME_SERVER="${GATEWAY_ACME_SERVER:-https://acme-v02.api.letsencrypt.org
 GATEWAY_ACME_RENEW_DAYS="${GATEWAY_ACME_RENEW_DAYS:-30}"
 # one directory per CA (acme/<directory host>): a certificate from another CA, e.g. Let's
 # Encrypt's staging one while testing, is never picked up after GATEWAY_ACME_SERVER changes
+if [ "${GATEWAY_ACME_DNS}" = "mesh" ]; then
+    LEGO_DNS=httpreq
+    export HTTPREQ_ENDPOINT="${BACKEND_URL}/acme-dns"
+    export HTTPREQ_USERNAME="${GATEWAY_PUBLIC_IP:-gateway}"
+    export HTTPREQ_PASSWORD="${GATEWAY_CERT_TOKEN}"
+    # NOTIFY + transfer to every secondary before Let's Encrypt asks one of them
+    export HTTPREQ_PROPAGATION_TIMEOUT="${HTTPREQ_PROPAGATION_TIMEOUT:-300}"
+    if [ -z "${GATEWAY_CERT_TOKEN}" ]; then
+        echo "WARNING: GATEWAY_ACME_DNS=mesh needs GATEWAY_CERT_TOKEN: no public certificate order"
+        GATEWAY_ACME_DNS=""
+    fi
+else
+    LEGO_DNS="${GATEWAY_ACME_DNS}"
+fi
 ACME_DIR="${GATEWAY_STATE_DIR}/acme/$(echo "${GATEWAY_ACME_SERVER}" | sed -e 's|^[a-z]*://||' -e 's|[/:].*$||')"
 ACME_DOMAIN="$(echo "${SERVER_DOMAIN}" | tr 'A-Z' 'a-z')"
 ACME_CERT="${ACME_DIR}/certificates/_.${ACME_DOMAIN}.crt"
@@ -357,7 +373,7 @@ public_cert_install() {
 # lego run (no certificate yet) or renew (one exists); 0 on success.
 public_cert_order() {
     set -- --accept-tos --path "${ACME_DIR}" --server "${GATEWAY_ACME_SERVER}" \
-        --dns "${GATEWAY_ACME_DNS}" --domains "*.${ACME_DOMAIN}" --email "${GATEWAY_ACME_EMAIL}"
+        --dns "${LEGO_DNS}" --domains "*.${ACME_DOMAIN}" --email "${GATEWAY_ACME_EMAIL}"
     if [ -s "${ACME_CERT}" ]; then
         lego "$@" renew --days "${GATEWAY_ACME_RENEW_DAYS}"
     else

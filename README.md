@@ -195,6 +195,11 @@ One key per name (mesh-router-nameserver `docs/phase-1.1-gateway-tls.md`). On
   **passed through** untouched to the box's best TLS-capable route (public IP, or the
   WireGuard address of a routed tunnel): the box presents its own certificate, the gateway
   holds no key for them;
+- **apex fallback:** a user's apex is passed through only while the backend's last probe
+  found a browser-trusted certificate on the box (`dns.certNotAfter` in `/resolve/v2`).
+  Without one it is terminated here with `*.<domain>`, which matches it, so the box's
+  dashboard stays reachable. Dot names have no fallback. No `dns` block = passthrough. The
+  flag is part of the cached per-user decision: no extra lookup per connection;
 - everything else (dash names through Cloudflare, `gateway.entrypoint.<domain>`, reserved
   labels, unknown users) is **terminated** here with a self-signed fallback generated at
   start. Cloudflare's "Full" SSL mode accepts it.

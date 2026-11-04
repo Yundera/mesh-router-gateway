@@ -10,9 +10,17 @@
     (<app>-<user>.<zone>), the gateway's own names (gateway.entrypoint.<zone>), reserved
     labels, unknown users, and boxes with no TLS-capable route (provider-only tunnel).
 
+    Apex fallback: the user apex is passed through only while the backend's last probe
+    found a browser-trusted certificate on the box (`dns.certNotAfter` in /resolve/v2).
+    Otherwise (not probed, mesh CA cert only, unreachable) it is terminated here with the
+    gateway's *.<zone>, which matches the apex, so the box's dashboard stays reachable.
+    Dot names cannot fall back (*.<zone> is one label deep) and are always passed through.
+    No `dns` block (deployment without our nameservers) = passthrough, as before. The flag
+    rides on the cached decision: no per-connection lookup beyond the existing cache.
+
     Decision per user label, cached CACHE_TTL seconds in ngx.shared.sni_routes
     ("host:port" to pass through, "host:port pp" when the box takes a PROXY header,
-    "-" to terminate). The decision is also kept STALE_TTL seconds under "stale:<label>" and
+    "-" to terminate; a trailing " apex" = terminate the apex, pass the dot names). The decision is also kept STALE_TTL seconds under "stale:<label>" and
     used while the backend cannot answer (transport error or 5xx), so a gateway on another
     host keeps passing through when the backend's host is down.
 
@@ -60,7 +68,8 @@ do
     end
 end
 
--- The user label of a passthrough candidate, or nil (terminate).
+-- The user label of a passthrough candidate and whether the name is that user's apex,
+-- or nil (terminate).
 local function candidate_label(name)
     local zone = (config.server_domain or ""):lower()
     local suffix = "." .. zone
@@ -78,7 +87,7 @@ local function candidate_label(name)
     if RESERVED[label] then
         return nil
     end
-    return label
+    return label, prefix == label
 end
 
 -- "host:port" of the box's best TLS-capable route, or nil.
@@ -123,20 +132,18 @@ local function lookup(label)
     if not target then
         return "-"
     end
-    return data.proxyProtocol == true and (target .. " pp") or target
+    if data.proxyProtocol == true then
+        target = target .. " pp"
+    end
+    -- apex fallback: our nameservers serve this user, and no trusted box certificate is known
+    if type(data.dns) == "table" and type(data.dns.certNotAfter) ~= "string" then
+        target = target .. " apex"
+    end
+    return target
 end
 
--- The cached decision for the connection's SNI: "host:port[ pp]", "-", or nil (terminate).
-local function decide()
-    local name = ngx.var.ssl_preread_server_name
-    if not name or name == "" then
-        return nil
-    end
-    local label = candidate_label(name:lower())
-    if not label then
-        return nil
-    end
-
+-- The cached decision for a user label: "host:port[ pp][ apex]", "-", or nil (terminate).
+local function lookup_cached(label)
     local cache = ngx.shared.sni_routes
     local target = cache:get(label)
     if not target then
@@ -167,13 +174,34 @@ local function decide()
     return target
 end
 
+-- The passthrough for the connection's SNI: the box address and whether it takes a PROXY
+-- header, or nil (terminate).
+local function passthrough()
+    local name = ngx.var.ssl_preread_server_name
+    if not name or name == "" then
+        return nil
+    end
+    local label, is_apex = candidate_label(name:lower())
+    if not label then
+        return nil
+    end
+    local target = lookup_cached(label)
+    if not target or target == "-" then
+        return nil
+    end
+    local addr, flags = target:match("^(%S+)(.*)$")
+    if is_apex and flags:find(" apex", 1, true) then
+        return nil -- apex fallback: no trusted box certificate, terminate with *.<zone>
+    end
+    return addr, flags:find(" pp", 1, true) ~= nil
+end
+
 -- The front: pass through (straight, or through the strip relay), or terminate.
 function _M.route()
-    local target = decide()
-    if not target or target == "-" then
+    local addr, pp = passthrough()
+    if not addr then
         return
     end
-    local addr, pp = target:match("^(%S+) (pp)$")
     if pp then
         ngx.var.tls_upstream = addr
         ngx.var.tls_mode = "passthrough"
@@ -187,8 +215,7 @@ end
 -- here for a passthrough; if the decision changed in between (cache expiry), close it:
 -- the HTTP server would expect a header this relay no longer sends.
 function _M.route_strip()
-    local target = decide()
-    local addr = target and target ~= "-" and target:match("^(%S+)")
+    local addr = passthrough()
     if not addr then
         ngx.log(ngx.WARN, "sni_router: strip relay without a passthrough decision, closing")
         return ngx.exit(ngx.ERROR)

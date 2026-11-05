@@ -91,7 +91,7 @@ This separation keeps the gateway simple and stateless.
 
 - **Simple domain-to-IP resolution** via pluggable REST API backend
 - **Resolution caching** to minimize backend calls (configurable TTL)
-- **SSL/TLS termination** with automatic Let's Encrypt certificates
+- **SSL/TLS termination** with automatic ACME certificates (ZeroSSL or Let's Encrypt, with a backup CA), including per-user fallback certificates for dot names
 - **WebSocket support** for real-time applications
 - **Large file uploads** (configurable, up to 20GB)
 - **Health checks** and graceful degradation
@@ -117,7 +117,13 @@ This separation keeps the gateway simple and stateless.
 | `GATEWAY_PUBLIC_IP` | This gateway's public IPv4, one of the backend's `DNS_GATEWAY_IPS`: names its gateway certificate (handoff, below) | Empty (takes no handoff) |
 | `GATEWAY_CERT_TOKEN` | The backend's `GATEWAY_CERT_TOKEN`, to get the gateway certificate | Empty (takes no handoff) |
 | `GATEWAY_ACME_DNS` | DNS provider for this gateway's public `*.<SERVER_DOMAIN>` certificate (see below): `cloudflare` while Cloudflare holds the zone, `mesh` once our nameservers do (the backend's `/acme-dns`, with `GATEWAY_CERT_TOKEN`), or any lego provider | Empty (self-signed fallback) |
-| `GATEWAY_ACME_SERVER` | ACME directory. Let's Encrypt staging for tests: `https://acme-staging-v02.api.letsencrypt.org/directory` | Let's Encrypt production |
+| `GATEWAY_ACME_SERVER` | Primary ACME directory. Yundera's gateways: ZeroSSL, `https://acme.zerossl.com/v2/DV90` (with EAB below). Let's Encrypt staging for tests: `https://acme-staging-v02.api.letsencrypt.org/directory` | Let's Encrypt production |
+| `GATEWAY_ACME_EAB_KID` / `GATEWAY_ACME_EAB_HMAC` | External Account Binding of the primary CA (ZeroSSL: one EAB credential per gateway, from its dashboard). Passed to lego through its environment, never on the command line | Empty (no EAB) |
+| `GATEWAY_ACME_BACKUP_SERVER` | Backup ACME directory (Let's Encrypt on Yundera's gateways), asked only while the primary has no valid certificate for a name | Empty (no backup) |
+| `GATEWAY_ACME_BACKUP_WEEKLY_MAX` | New certificates the backup may issue per 7 days, all names together: the zone's Let's Encrypt bucket belongs to the boxes | `10` |
+| `GATEWAY_ACME_LEGO_ARGS` | Extra lego global options, e.g. `--dns.resolvers 9.9.9.9:53` | Empty |
+| `GATEWAY_FALLBACK_CERTS` | `on`: hold a fallback `*.<user>.<zone>` per live user and terminate a user's dot names with it while the box has no trusted certificate (below). DNS-01 always through the backend's acme-dns (users' zones are ours, whatever `GATEWAY_ACME_DNS` says for the parent zone): needs `GATEWAY_CERT_TOKEN` | `off` |
+| `FALLBACK_POLL` | Seconds between two reads of the live users (`/gateway/fallback-labels`) | `60` |
 | `GATEWAY_ACME_EMAIL` | ACME account contact (lego requires one) | `admin@<SERVER_DOMAIN>` |
 | `GATEWAY_ACME_RENEW_DAYS` | Renew when fewer days than this are left | `30` |
 | `CLOUDFLARE_DNS_API_TOKEN` | With `GATEWAY_ACME_DNS=cloudflare`: a token with DNS edit on this zone only, IP-filtered to the gateways | — |
@@ -138,9 +144,17 @@ backend.
 
 ### Public certificate `*.<zone>`
 
-With `GATEWAY_ACME_DNS` set, each gateway orders its own Let's Encrypt `*.<SERVER_DOMAIN>`
-by DNS-01 with [lego](https://go-acme.github.io/lego/) (in the image): its own ACME account
-and key, kept in `GATEWAY_STATE_DIR/acme/<CA host>/`. The HTTP TLS server presents it for
+With `GATEWAY_ACME_DNS` set, each gateway orders its own `*.<SERVER_DOMAIN>` by DNS-01 with
+[lego](https://go-acme.github.io/lego/) (in the image): its own ACME account and key per CA,
+kept in `GATEWAY_STATE_DIR/acme/<CA host>/`.
+
+Two CAs (`scripts/acme-lib.sh`): the primary `GATEWAY_ACME_SERVER` (ZeroSSL with EAB on
+Yundera's gateways), and the backup `GATEWAY_ACME_BACKUP_SERVER` (Let's Encrypt), asked only
+while the primary has no valid certificate for the name, at most
+`GATEWAY_ACME_BACKUP_WEEKLY_MAX` new certificates a week (the zone's Let's Encrypt bucket,
+50 new certificates a week, is the boxes'). The primary's certificate is served whenever it
+is valid, else the backup's. A CA that no longer knows the stored account (deactivated,
+EAB revoked) gets a new one, once; the old account is kept as `accounts.lost-<time>`. The HTTP TLS server presents it for
 every name it terminates; the handoff name keeps its mesh CA certificate, and dot names /
 apexes passed through to boxes are untouched. The gateway never waits for an order: it
 starts on the stored certificate (or the self-signed fallback), orders in the background
@@ -153,9 +167,35 @@ Before the NS switch the challenge TXT is written through Cloudflare's API
 `GATEWAY_ACME_DNS=mesh` and delete the token. `mesh` is lego's httpreq provider against
 the backend (`BACKEND_URL/acme-dns/present|cleanup`), authenticated with the gateway's
 `GATEWAY_CERT_TOKEN` (already there for the handoff certificate), which may write
-`_acme-challenge.<zone>` in the apex zone and nothing else; the backend needs
-`DNS_STATIC_ZONE_FILE` (the apex zone is ours). The certificate already issued keeps
+`_acme-challenge.<zone>` in the apex zone (the backend needs `DNS_STATIC_ZONE_FILE`: the
+apex zone is ours) and, from backend 2.0.62, live users' `_acme-challenge.<user>.<zone>`
+(fallback certificates, below). The certificate already issued keeps
 serving, so the switch needs no order at all; the next renewal goes through our nameservers.
+
+### Fallback certificates for dot names
+
+With `GATEWAY_FALLBACK_CERTS=on` (backend 2.0.62+), the gateway holds a fallback
+`*.<user>.<zone>` for every live user, so a user's dot names never show a certificate error
+while the box has no trusted certificate of its own (just created, rebuilt, its order
+refused). `scripts/fallback-certs.sh`:
+
+- reads the live users every `FALLBACK_POLL` seconds (`GET /gateway/fallback-labels`,
+  `GATEWAY_CERT_TOKEN`); dormant zones are left out: they publish no challenge TXT and
+  their dot names are asked by nobody;
+- orders or renews each user's wildcard through the same two CAs as `*.<zone>`, one at a
+  time; a failed order waits 10 min, doubling up to 6 h, before the next try;
+- keeps the certificate to serve in `GATEWAY_STATE_DIR/fallback/<user>.pem` (chain + key,
+  replaced atomically, readable by nginx's workers: `root:nobody` 0640);
+- writes `fallback/index.json`, served at `/.well-known/mesh-gateway/fallback`
+  (`{"labels":{"<user>":"<notAfter>"}}`): the backend reads it to judge the gateway's
+  coverage, and with `DNS_GATEWAY_FALLBACK_REQUIRED=1` keeps a gateway that misses users out
+  of the answers (never the last one).
+
+A user no longer listed keeps its file until the certificate expires, then it is removed.
+The HTTP TLS server picks the file by SNI (`nginx/lua/fallback_certs.lua`, cached per
+worker for a minute, so a renewal is served without a reload). Transparency: the browser
+shows which certificate a connection got, and mesh-console's Certificates page shows who
+decrypts each address (`phase-1.1-gateway-tls.md` §7).
 
 ### Handoff between gateways
 
@@ -193,13 +233,14 @@ One key per name (mesh-router-nameserver `docs/phase-1.1-gateway-tls.md`). On
 
 - a user's dot names and apex (`<anything>.<user>.<domain>`, `<user>.<domain>`) are
   **passed through** untouched to the box's best TLS-capable route (public IP, or the
-  WireGuard address of a routed tunnel): the box presents its own certificate, the gateway
-  holds no key for them;
-- **apex fallback:** a user's apex is passed through only while the backend's last probe
-  found a browser-trusted certificate on the box (`dns.certNotAfter` in `/resolve/v2`).
-  Without one it is terminated here with `*.<domain>`, which matches it, so the box's
-  dashboard stays reachable. Dot names have no fallback. No `dns` block = passthrough. The
-  flag is part of the cached per-user decision: no extra lookup per connection;
+  WireGuard address of a routed tunnel) while the box holds a trusted certificate: the box
+  presents its own, and the gateway cannot read the traffic;
+- **fallback:** "trusted" is the backend's last probe (`dns.certNotAfter` in
+  `/resolve/v2`: the apex and the wildcard both verified). Without it, the apex is
+  terminated here with `*.<domain>`, which matches it, and the dot names with this
+  gateway's fallback `*.<user>.<domain>` when it holds one (previous section); without a
+  fallback file they are passed through as before. No `dns` block = passthrough. The flag
+  is part of the cached per-user decision: no extra lookup per connection;
 - everything else (dash names through Cloudflare, `gateway.entrypoint.<domain>`, reserved
   labels, unknown users) is **terminated** here with a self-signed fallback generated at
   start. Cloudflare's "Full" SSL mode accepts it.
@@ -369,13 +410,17 @@ mesh-router-gateway/
 ├── nginx/
 │   ├── nginx.conf              # Main Nginx configuration
 │   ├── gateway.conf            # Server block for gateway
-│   ├── gateway-common.conf     # Locations: / and @mesh_handoff
+│   ├── gateway-common.conf     # Locations: /, @mesh_handoff, fallback coverage
 │   ├── gateway-proxy.conf      # The proxy hop, shared by both locations
 │   └── lua/
 │       ├── resolver.lua        # Domain resolution logic
 │       ├── handoff.lua         # Handoff to another gateway (direct or retry)
 │       ├── request_log.lua     # Final status log line
-│       └── sni_router.lua      # TLS front: pass through or terminate
+│       ├── sni_router.lua      # TLS front: pass through or terminate
+│       └── fallback_certs.lua  # Per-user fallback certificates by SNI + coverage endpoint
+├── scripts/
+│   ├── acme-lib.sh             # Two-CA ACME helpers (primary + capped backup), lego
+│   └── fallback-certs.sh       # Fallback *.<user>.<zone> loop
 ├── src/                        # (Optional) Node.js health/metrics
 │   └── index.ts
 ├── Dockerfile

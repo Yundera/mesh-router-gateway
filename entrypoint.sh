@@ -87,7 +87,13 @@ cp "${CA_STORED}" "${CA_CERT_PATH}"
 cat /etc/ssl/certs/ca-certificates.crt "${CA_CERT_PATH}" > /etc/ssl/certs/lua-trust.pem
 
 # Generate Lua config from template
-envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${RESOLVE_STALE_TTL} ${DEFAULT_BACKEND} ${TUNNEL_SUBNET}' \
+# Fallback certificates (below): where the Lua side finds them; empty = off
+export GATEWAY_FALLBACK_DIR=""
+if [ "${GATEWAY_FALLBACK_CERTS:-off}" = "on" ]; then
+    GATEWAY_FALLBACK_DIR="${GATEWAY_STATE_DIR}/fallback"
+    mkdir -p "${GATEWAY_FALLBACK_DIR}"
+fi
+envsubst '${SERVER_DOMAIN} ${BACKEND_URL} ${CACHE_TTL} ${RESOLVE_STALE_TTL} ${DEFAULT_BACKEND} ${TUNNEL_SUBNET} ${GATEWAY_FALLBACK_DIR}' \
     < /etc/nginx/lua/config.lua.template \
     > /etc/nginx/lua/config.lua
 
@@ -261,6 +267,11 @@ server {
 
     ssl_certificate /etc/nginx/certs/default.crt;
     ssl_certificate_key /etc/nginx/certs/default.key;
+    # a user's dot names, terminated while the box has no trusted certificate: this
+    # gateway's fallback *.<user>.<zone> (fallback_certs.lua; no file = the default above)
+    ssl_certificate_by_lua_block {
+        require("fallback_certs").serve()
+    }
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:gateway_tls:10m;
 
@@ -312,30 +323,38 @@ if [ "${GW_CERT_READY}" = "1" ]; then
 fi
 
 # Public certificate *.<SERVER_DOMAIN> (cutoff gate G6, phase-1.1-gateway-tls.md §6.1 in
-# mesh-router-nameserver): each gateway orders its own from Let's Encrypt by DNS-01 with
-# lego, one ACME account and one key per gateway, kept in GATEWAY_STATE_DIR/acme. The
-# HTTP TLS server presents it for every name it terminates; the handoff name keeps its
-# mesh CA certificate. GATEWAY_ACME_DNS is lego's DNS provider: "cloudflare" while
-# Cloudflare holds the zone (CLOUDFLARE_DNS_API_TOKEN, DNS edit on this zone only),
-# "mesh" once our nameservers do: lego's httpreq against the backend (BACKEND_URL
-# /acme-dns/present|cleanup) with this gateway's GATEWAY_CERT_TOKEN, which writes
-# _acme-challenge.<zone> into the apex zone. Any other lego provider name works too,
-# with that provider's own variables. Empty = off: the self-signed fallback, as before. The gateway never waits for an order: it
-# starts on the stored certificate or the fallback, and swaps in a new one with a reload.
+# mesh-router-nameserver): each gateway orders its own by DNS-01 with lego, one ACME
+# account and one key per gateway and CA, kept in GATEWAY_STATE_DIR/acme. The HTTP TLS
+# server presents it for every name it terminates; the handoff name keeps its mesh CA
+# certificate. GATEWAY_ACME_DNS is lego's DNS provider: "cloudflare" while Cloudflare holds
+# the zone (CLOUDFLARE_DNS_API_TOKEN, DNS edit on this zone only), "mesh" once our
+# nameservers do: lego's httpreq against the backend (BACKEND_URL /acme-dns/present|cleanup)
+# with this gateway's GATEWAY_CERT_TOKEN, which writes _acme-challenge.<zone> into the apex
+# zone. Any other lego provider name works too, with that provider's own variables. Empty =
+# off: the self-signed fallback, as before. The gateway never waits for an order: it starts
+# on the stored certificate or the fallback, and swaps in a new one with a reload.
+#
+# CAs (scripts/acme-lib.sh): GATEWAY_ACME_SERVER is the primary (ZeroSSL on Yundera's
+# gateways: https://acme.zerossl.com/v2/DV90 with GATEWAY_ACME_EAB_KID/_HMAC), and
+# GATEWAY_ACME_BACKUP_SERVER the backup (Let's Encrypt), asked only while the primary has
+# no valid certificate, at most GATEWAY_ACME_BACKUP_WEEKLY_MAX new ones a week.
 GATEWAY_ACME_DNS="${GATEWAY_ACME_DNS:-}"
 # the ACME account's contact (lego requires one): an alias of the zone by default
-GATEWAY_ACME_EMAIL="${GATEWAY_ACME_EMAIL:-admin@$(echo "${SERVER_DOMAIN}" | tr 'A-Z' 'a-z')}"
-GATEWAY_ACME_SERVER="${GATEWAY_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
-# renew once fewer than this many days are left (Let's Encrypt certificates last 90)
-GATEWAY_ACME_RENEW_DAYS="${GATEWAY_ACME_RENEW_DAYS:-30}"
-# one directory per CA (acme/<directory host>): a certificate from another CA, e.g. Let's
-# Encrypt's staging one while testing, is never picked up after GATEWAY_ACME_SERVER changes
+export GATEWAY_ACME_EMAIL="${GATEWAY_ACME_EMAIL:-admin@$(echo "${SERVER_DOMAIN}" | tr 'A-Z' 'a-z')}"
+export GATEWAY_ACME_SERVER="${GATEWAY_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+# renew once fewer than this many days are left (both CAs issue 90-day certificates)
+export GATEWAY_ACME_RENEW_DAYS="${GATEWAY_ACME_RENEW_DAYS:-30}"
+export GATEWAY_ACME_BACKUP_SERVER="${GATEWAY_ACME_BACKUP_SERVER:-}"
+export GATEWAY_ACME_BACKUP_WEEKLY_MAX="${GATEWAY_ACME_BACKUP_WEEKLY_MAX:-10}"
+export GATEWAY_ACME_EAB_KID="${GATEWAY_ACME_EAB_KID:-}"
+export GATEWAY_ACME_EAB_HMAC="${GATEWAY_ACME_EAB_HMAC:-}"
+export GATEWAY_STATE_DIR
 if [ "${GATEWAY_ACME_DNS}" = "mesh" ]; then
     LEGO_DNS=httpreq
     export HTTPREQ_ENDPOINT="${BACKEND_URL}/acme-dns"
     export HTTPREQ_USERNAME="${GATEWAY_PUBLIC_IP:-gateway}"
     export HTTPREQ_PASSWORD="${GATEWAY_CERT_TOKEN}"
-    # NOTIFY + transfer to every secondary before Let's Encrypt asks one of them
+    # NOTIFY + transfer to every secondary before the CA asks one of them
     export HTTPREQ_PROPAGATION_TIMEOUT="${HTTPREQ_PROPAGATION_TIMEOUT:-300}"
     if [ -z "${GATEWAY_CERT_TOKEN}" ]; then
         echo "WARNING: GATEWAY_ACME_DNS=mesh needs GATEWAY_CERT_TOKEN: no public certificate order"
@@ -344,48 +363,30 @@ if [ "${GATEWAY_ACME_DNS}" = "mesh" ]; then
 else
     LEGO_DNS="${GATEWAY_ACME_DNS}"
 fi
-ACME_DIR="${GATEWAY_STATE_DIR}/acme/$(echo "${GATEWAY_ACME_SERVER}" | sed -e 's|^[a-z]*://||' -e 's|[/:].*$||')"
+export LEGO_DNS
 ACME_DOMAIN="$(echo "${SERVER_DOMAIN}" | tr 'A-Z' 'a-z')"
-ACME_CERT="${ACME_DIR}/certificates/_.${ACME_DOMAIN}.crt"
-ACME_KEY="${ACME_DIR}/certificates/_.${ACME_DOMAIN}.key"
+. /usr/local/lib/mesh-acme.sh
 
-# 0 when the stored public certificate is valid for at least $1 more seconds and names
-# *.<zone> (a stored one from another SERVER_DOMAIN or CA directory is not used).
-public_cert_valid() {
-    [ -s "${ACME_CERT}" ] && [ -s "${ACME_KEY}" ] \
-        && openssl x509 -noout -checkend "$1" -in "${ACME_CERT}" >/dev/null 2>&1 \
-        && openssl x509 -noout -ext subjectAltName -in "${ACME_CERT}" 2>/dev/null | grep -q "DNS:\*\.${ACME_DOMAIN}"
-}
-
-# Puts the stored public certificate in front; $1 = 1 to reload nginx afterwards.
+# Puts the best stored public certificate in front (acme_best); $1 = 1 to reload nginx.
 public_cert_install() {
-    cp -f "${ACME_KEY}" /etc/nginx/certs/default.key.new \
-        && cp -f "${ACME_CERT}" /etc/nginx/certs/default.crt.new \
+    set -- "$1" $(acme_best "${ACME_DOMAIN}")
+    [ -n "$2" ] || return 1
+    cp -f "$3" /etc/nginx/certs/default.key.new \
+        && cp -f "$2" /etc/nginx/certs/default.crt.new \
         && mv -f /etc/nginx/certs/default.key.new /etc/nginx/certs/default.key \
         && mv -f /etc/nginx/certs/default.crt.new /etc/nginx/certs/default.crt \
         || return 1
-    echo "Public certificate *.${ACME_DOMAIN} in use, until $(openssl x509 -noout -enddate -in "${ACME_CERT}" | cut -d= -f2) (issuer: $(openssl x509 -noout -issuer -in "${ACME_CERT}" | sed 's/^issuer=//'))"
+    echo "Public certificate *.${ACME_DOMAIN} in use, until $(openssl x509 -noout -enddate -in "$2" | cut -d= -f2) (issuer: $(openssl x509 -noout -issuer -in "$2" | sed 's/^issuer=//'))"
     if [ "$1" = "1" ]; then
         openresty -s reload
     fi
 }
 
-# lego run (no certificate yet) or renew (one exists); 0 on success.
-public_cert_order() {
-    set -- --accept-tos --path "${ACME_DIR}" --server "${GATEWAY_ACME_SERVER}" \
-        --dns "${LEGO_DNS}" --domains "*.${ACME_DOMAIN}" --email "${GATEWAY_ACME_EMAIL}"
-    if [ -s "${ACME_CERT}" ]; then
-        lego "$@" renew --days "${GATEWAY_ACME_RENEW_DAYS}"
-    else
-        lego "$@" run
-    fi
-}
-
 if [ -n "${GATEWAY_ACME_DNS}" ] && [ "${GATEWAY_TLS_PORT}" != "off" ]; then
-    mkdir -p "${ACME_DIR}"
-    chmod 700 "${GATEWAY_STATE_DIR}/acme" "${ACME_DIR}"
-    echo "  Public certificate: *.${ACME_DOMAIN} by DNS-01 (${GATEWAY_ACME_DNS}, ${GATEWAY_ACME_SERVER})"
-    if public_cert_valid 0; then
+    mkdir -p "${GATEWAY_STATE_DIR}/acme"
+    chmod 700 "${GATEWAY_STATE_DIR}/acme"
+    echo "  Public certificate: *.${ACME_DOMAIN} by DNS-01 (${GATEWAY_ACME_DNS}, ${GATEWAY_ACME_SERVER}$([ -n "${GATEWAY_ACME_EAB_KID}" ] && echo ' with EAB')${GATEWAY_ACME_BACKUP_SERVER:+, backup ${GATEWAY_ACME_BACKUP_SERVER}})"
+    if [ -n "$(acme_best "${ACME_DOMAIN}")" ]; then
         public_cert_install 0 || echo "WARNING: stored public certificate not installed, self-signed fallback"
     else
         echo "  No valid public certificate stored yet: self-signed fallback until the order succeeds"
@@ -396,16 +397,13 @@ if [ -n "${GATEWAY_ACME_DNS}" ] && [ "${GATEWAY_TLS_PORT}" != "off" ]; then
     (
         sleep 10
         while :; do
-            BEFORE="$(openssl x509 -noout -fingerprint -sha256 -in "${ACME_CERT}" 2>/dev/null || true)"
-            if public_cert_order; then
-                AFTER="$(openssl x509 -noout -fingerprint -sha256 -in "${ACME_CERT}" 2>/dev/null || true)"
-                if [ "${AFTER}" != "${BEFORE}" ] && public_cert_valid 0; then
-                    public_cert_install 1 || echo "WARNING: public certificate obtained but not installed"
-                fi
-            else
-                echo "WARNING: public certificate order/renewal failed (lego output above)"
+            BEFORE="$(acme_fingerprint /etc/nginx/certs/default.crt)"
+            acme_obtain "${ACME_DOMAIN}" || echo "WARNING: no valid public certificate (lego output above)"
+            BEST="$(acme_best "${ACME_DOMAIN}")"
+            if [ -n "${BEST}" ] && [ "$(acme_fingerprint "${BEST%% *}")" != "${BEFORE}" ]; then
+                public_cert_install 1 || echo "WARNING: public certificate obtained but not installed"
             fi
-            if public_cert_valid 0; then
+            if [ -n "$(acme_best "${ACME_DOMAIN}")" ]; then
                 sleep 43200
             else
                 sleep 3600
@@ -414,6 +412,27 @@ if [ -n "${GATEWAY_ACME_DNS}" ] && [ "${GATEWAY_TLS_PORT}" != "off" ]; then
     ) &
 else
     echo "  Public certificate: off (GATEWAY_ACME_DNS unset): self-signed fallback"
+fi
+
+# Fallback certificates (phase-1.1-gateway-tls.md §6.3): one *.<user>.<zone> per live user,
+# so this gateway can terminate a user's dot names while the box has no trusted
+# certificate of its own (sni_router.lua). Same CAs as above; DNS-01 always through the
+# backend's acme-dns (a live user's zone is ours, whatever GATEWAY_ACME_DNS says for the
+# parent zone), so it needs GATEWAY_CERT_TOKEN. scripts/fallback-certs.sh keeps
+# GATEWAY_STATE_DIR/fallback/<label>.pem and index.json (the coverage the backend reads).
+GATEWAY_FALLBACK_CERTS="${GATEWAY_FALLBACK_CERTS:-off}"
+if [ "${GATEWAY_FALLBACK_CERTS}" = "on" ]; then
+    if [ -n "${GATEWAY_CERT_TOKEN}" ] && [ "${GATEWAY_TLS_PORT}" != "off" ]; then
+        echo "  Fallback certificates: on (${GATEWAY_STATE_DIR}/fallback)"
+        ACME_DOMAIN="${ACME_DOMAIN}" LEGO_DNS=httpreq \
+            HTTPREQ_ENDPOINT="${BACKEND_URL}/acme-dns" HTTPREQ_USERNAME="${GATEWAY_PUBLIC_IP:-gateway}" \
+            HTTPREQ_PASSWORD="${GATEWAY_CERT_TOKEN}" HTTPREQ_PROPAGATION_TIMEOUT="${HTTPREQ_PROPAGATION_TIMEOUT:-300}" \
+            /usr/local/bin/fallback-certs.sh &
+    else
+        echo "WARNING: GATEWAY_FALLBACK_CERTS=on needs GATEWAY_CERT_TOKEN and the TLS port: fallback certificates off"
+    fi
+else
+    echo "  Fallback certificates: off (GATEWAY_FALLBACK_CERTS)"
 fi
 
 # Start OpenResty (nginx) in foreground

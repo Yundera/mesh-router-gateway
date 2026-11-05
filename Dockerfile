@@ -47,8 +47,9 @@ RUN apk add --no-cache \
     openssl \
     ca-certificates
 
-# lego: orders this gateway's public *.<zone> certificate by DNS-01 (entrypoint.sh,
-# GATEWAY_ACME_DNS). The official image's static binary only.
+# lego: orders this gateway's public *.<zone> certificate and its per-user fallback
+# certificates by DNS-01 (entrypoint.sh, scripts/fallback-certs.sh, GATEWAY_ACME_DNS). The
+# official image's static binary only.
 COPY --from=goacme/lego:v4.28.1 /lego /usr/local/bin/lego
 
 # Install lua-resty-http library
@@ -69,12 +70,17 @@ COPY nginx/lua/resolver.lua /etc/nginx/lua/resolver.lua
 COPY nginx/lua/sni_router.lua /etc/nginx/lua/sni_router.lua
 COPY nginx/lua/handoff.lua /etc/nginx/lua/handoff.lua
 COPY nginx/lua/request_log.lua /etc/nginx/lua/request_log.lua
+COPY nginx/lua/fallback_certs.lua /etc/nginx/lua/fallback_certs.lua
 RUN mkdir -p /etc/nginx/stream.d
 COPY nginx/lua/config.lua.template /etc/nginx/lua/config.lua.template
 
+# ACME helpers (two CAs, backup cap) and the fallback-certificate loop
+COPY scripts/acme-lib.sh /usr/local/lib/mesh-acme.sh
+COPY scripts/fallback-certs.sh /usr/local/bin/fallback-certs.sh
+
 # Copy entrypoint
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh /usr/local/bin/fallback-certs.sh
 
 # Create temp directories
 RUN mkdir -p /tmp/nginx/client_temp && \

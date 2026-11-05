@@ -3,24 +3,27 @@
 
     One key per name: a user's dot-form names (<app>.<user>.<zone>) and apex
     (<user>.<zone>) are the box's, so their TLS goes to the box untouched over its best
-    TLS-capable route (public IP, or the WireGuard address of a routed tunnel). The
-    gateway cannot read that traffic.
+    TLS-capable route (public IP, or the WireGuard address of a routed tunnel), while the
+    box holds a trusted certificate. The gateway cannot read that traffic.
 
     Everything else is terminated here (the HTTP TLS server on a local socket): dash names
     (<app>-<user>.<zone>), the gateway's own names (gateway.entrypoint.<zone>), reserved
     labels, unknown users, and boxes with no TLS-capable route (provider-only tunnel).
 
-    Apex fallback: the user apex is passed through only while the backend's last probe
-    found a browser-trusted certificate on the box (`dns.certNotAfter` in /resolve/v2).
-    Otherwise (not probed, mesh CA cert only, unreachable) it is terminated here with the
-    gateway's *.<zone>, which matches the apex, so the box's dashboard stays reachable.
-    Dot names cannot fall back (*.<zone> is one label deep) and are always passed through.
-    No `dns` block (deployment without our nameservers) = passthrough, as before. The flag
-    rides on the cached decision: no per-connection lookup beyond the existing cache.
+    Fallback: the user apex and dot names are passed through only while the backend's last
+    probe found a browser-trusted certificate on the box (`dns.certNotAfter` in
+    /resolve/v2: the apex and the wildcard both verified). Otherwise (not probed, mesh CA
+    cert only, unreachable) they are terminated here: the apex with the gateway's *.<zone>,
+    which matches it, and the dot names with this gateway's fallback *.<user>.<zone>
+    (fallback_certs.lua) when it holds one, else passed through as before (*.<zone> is one
+    label deep). No `dns` block (deployment without our nameservers) = passthrough, as
+    before. The flag rides on the cached decision: no per-connection lookup beyond the
+    existing cache.
 
     Decision per user label, cached CACHE_TTL seconds in ngx.shared.sni_routes
     ("host:port" to pass through, "host:port pp" when the box takes a PROXY header,
-    "-" to terminate; a trailing " apex" = terminate the apex, pass the dot names). The decision is also kept STALE_TTL seconds under "stale:<label>" and
+    "-" to terminate; a trailing " untrusted" = no trusted box certificate: terminate the
+    apex, and the dot names when a fallback certificate is held). The decision is also kept STALE_TTL seconds under "stale:<label>" and
     used while the backend cannot answer (transport error or 5xx), so a gateway on another
     host keeps passing through when the backend's host is down.
 
@@ -33,6 +36,7 @@
 local http = require "resty.http"
 local cjson = require "cjson.safe"
 local config = require "config"
+local fallback_certs = require "fallback_certs"
 
 local _M = {}
 
@@ -135,14 +139,14 @@ local function lookup(label)
     if data.proxyProtocol == true then
         target = target .. " pp"
     end
-    -- apex fallback: our nameservers serve this user, and no trusted box certificate is known
+    -- fallback: our nameservers serve this user, and no trusted box certificate is known
     if type(data.dns) == "table" and type(data.dns.certNotAfter) ~= "string" then
-        target = target .. " apex"
+        target = target .. " untrusted"
     end
     return target
 end
 
--- The cached decision for a user label: "host:port[ pp][ apex]", "-", or nil (terminate).
+-- The cached decision for a user label: "host:port[ pp][ untrusted]", "-", or nil (terminate).
 local function lookup_cached(label)
     local cache = ngx.shared.sni_routes
     local target = cache:get(label)
@@ -174,6 +178,18 @@ local function lookup_cached(label)
     return target
 end
 
+-- True when this gateway holds a fallback certificate for the label (cached CACHE_TTL).
+local function has_fallback(label)
+    local cache = ngx.shared.sni_routes
+    local key = "fb:" .. label
+    local held = cache:get(key)
+    if held == nil then
+        held = fallback_certs.has(label)
+        cache:set(key, held, CACHE_TTL)
+    end
+    return held
+end
+
 -- The passthrough for the connection's SNI: the box address and whether it takes a PROXY
 -- header, or nil (terminate).
 local function passthrough()
@@ -190,8 +206,13 @@ local function passthrough()
         return nil
     end
     local addr, flags = target:match("^(%S+)(.*)$")
-    if is_apex and flags:find(" apex", 1, true) then
-        return nil -- apex fallback: no trusted box certificate, terminate with *.<zone>
+    if flags:find(" untrusted", 1, true) then
+        if is_apex then
+            return nil -- no trusted box certificate: terminate the apex with *.<zone>
+        end
+        if has_fallback(label) then
+            return nil -- no trusted box certificate: terminate with the fallback *.<user>.<zone>
+        end
     end
     return addr, flags:find(" pp", 1, true) ~= nil
 end

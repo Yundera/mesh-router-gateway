@@ -121,7 +121,9 @@ This separation keeps the gateway simple and stateless.
 | `GATEWAY_ACME_EAB_KID` / `GATEWAY_ACME_EAB_HMAC` | External Account Binding of the primary CA (ZeroSSL: one EAB credential per gateway, from its dashboard). Passed to lego through its environment, never on the command line | Empty (no EAB) |
 | `GATEWAY_ACME_BACKUP_SERVER` | Backup ACME directory (Let's Encrypt on Yundera's gateways), asked only while the primary has no valid certificate for a name | Empty (no backup) |
 | `GATEWAY_ACME_BACKUP_WEEKLY_MAX` | New certificates the backup may issue per 7 days, all names together: the zone's Let's Encrypt bucket belongs to the boxes | `10` |
-| `GATEWAY_ACME_LEGO_ARGS` | Extra lego global options, e.g. `--dns.resolvers 9.9.9.9:53` | Empty |
+| `GATEWAY_ACME_LEGO_ARGS` | Extra lego global options, e.g. `--dns.resolvers 9.9.9.9:53`. Passed after the gateway's own options, so they win | Empty |
+| `GATEWAY_ACME_HTTP_TIMEOUT` | Seconds one ACME request may take (lego `--http-timeout`; lego's own default is none, and a CA that accepts the connection and never answers held a run for good) | `60` |
+| `GATEWAY_ACME_RUN_TIMEOUT` | Seconds one lego run may take before it is killed (TERM, KILL 30 s later), so a stuck run can't hold the lock both certificate loops share. A killed run's Cloudflare challenge TXT is removed by the gateway (lego can't), since a leftover makes the next order fail | `900` |
 | `GATEWAY_FALLBACK_CERTS` | `on`: hold a fallback `*.<user>.<zone>` per live user and terminate a user's dot names with it while the box has no trusted certificate (below). DNS-01 always through the backend's acme-dns (users' zones are ours, whatever `GATEWAY_ACME_DNS` says for the parent zone): needs `GATEWAY_CERT_TOKEN` | `off` |
 | `FALLBACK_POLL` | Seconds between two reads of the live users (`/gateway/fallback-labels`) | `60` |
 | `GATEWAY_ACME_EMAIL` | ACME account contact (lego requires one) | `admin@<SERVER_DOMAIN>` |

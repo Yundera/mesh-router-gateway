@@ -23,6 +23,12 @@ GATEWAY_ACME_EAB_KID="${GATEWAY_ACME_EAB_KID:-}"
 GATEWAY_ACME_EAB_HMAC="${GATEWAY_ACME_EAB_HMAC:-}"
 # extra lego global options, e.g. "--dns.resolvers 9.9.9.9:53" (tests: "--dns.propagation-wait 2s")
 GATEWAY_ACME_LEGO_ARGS="${GATEWAY_ACME_LEGO_ARGS:-}"
+# Bounds on one lego run. lego's own HTTP timeout is off by default: a CA that accepts a
+# connection and never answers held a run for good (ZeroSSL, nsp1 2026-11-06), and with
+# it the lock both loops share. Per ACME request, then for the whole run (TERM, KILL 30 s
+# later). The run bound leaves room for the 2 min propagation wait and a slow CA.
+GATEWAY_ACME_HTTP_TIMEOUT="${GATEWAY_ACME_HTTP_TIMEOUT:-60}"
+GATEWAY_ACME_RUN_TIMEOUT="${GATEWAY_ACME_RUN_TIMEOUT:-900}"
 ACME_LOCK="${GATEWAY_STATE_DIR}/acme/.lego.lock"
 ACME_BACKUP_LOG="${GATEWAY_STATE_DIR}/acme/backup-orders"
 
@@ -56,6 +62,31 @@ acme_backup_count() {
     awk -v s="${_since}" '$1 >= s' "${ACME_BACKUP_LOG}" | wc -l | tr -d ' '
 }
 
+# After a run was killed: lego had no chance to remove its challenge TXT. With the
+# cloudflare provider a leftover breaks the next order, since the CA hands the same
+# pending challenge back and Cloudflare refuses an identical record. Delete exactly the
+# records this run created (their IDs are in its output, $1). Other providers: nothing to
+# do (the backend's acme-dns takes the same value again).
+acme_cleanup_killed() {
+    [ "${LEGO_DNS}" = "cloudflare" ] || return 0
+    _cf_token="${CLOUDFLARE_DNS_API_TOKEN:-${CF_DNS_API_TOKEN:-}}"
+    [ -n "${_cf_token}" ] || return 0
+    # lego: "[INFO] cloudflare: new record for <zone>, ID <record id>"
+    sed -n 's/.*cloudflare: new record for \([^,]*\), ID \([0-9a-f]*\).*/\1 \2/p' "$1" \
+        | while read -r _zone _id; do
+            _zid="$(curl -s -m 20 -H "Authorization: Bearer ${_cf_token}" \
+                "https://api.cloudflare.com/client/v4/zones?name=${_zone}" \
+                | grep -o '"id":"[0-9a-f]\{32\}"' | head -1 | cut -d'"' -f4)"
+            if [ -n "${_zid}" ] && curl -s -m 20 -X DELETE -H "Authorization: Bearer ${_cf_token}" \
+                "https://api.cloudflare.com/client/v4/zones/${_zid}/dns_records/${_id}" \
+                | grep -q '"success":true'; then
+                echo "acme: removed the challenge TXT ${_id} the killed run left in ${_zone}"
+            else
+                echo "WARNING: acme: could not remove the challenge TXT ${_id} in ${_zone}: delete it by hand, the next order fails while it exists"
+            fi
+        done
+}
+
 # One lego run (or renew) for *.$2 at CA $1; $3 = "primary" adds the EAB credential.
 # 0 on success.
 acme_lego() {
@@ -81,14 +112,22 @@ acme_lego() {
         # lego's output streams to the container log as it runs, and is kept in _log to
         # recognise a forgotten account; the exit status goes through a file (a pipe's
         # status is tee's in sh)
+        # GATEWAY_ACME_LEGO_ARGS comes after --http-timeout, so its own value wins.
         # shellcheck disable=SC2086 # _cmd and GATEWAY_ACME_LEGO_ARGS are word lists
         { LEGO_EAB="$5" LEGO_EAB_KID="$6" LEGO_EAB_HMAC="$7" flock "${ACME_LOCK}" \
-            lego --accept-tos --path "$4" --server "$1" --dns "${LEGO_DNS}" ${GATEWAY_ACME_LEGO_ARGS} \
+            timeout -s TERM -k 30 "${GATEWAY_ACME_RUN_TIMEOUT}" \
+            lego --accept-tos --path "$4" --server "$1" --dns "${LEGO_DNS}" \
+            --http-timeout "${GATEWAY_ACME_HTTP_TIMEOUT}" ${GATEWAY_ACME_LEGO_ARGS} \
             --domains "*.$2" --email "${GATEWAY_ACME_EMAIL}" ${_cmd} 2>&1; echo $? > "${_log}.rc"; } | tee "${_log}"
         _rc="$(cat "${_log}.rc" 2>/dev/null || echo 1)"
         if [ "${_rc}" -eq 0 ]; then
             rm -f "${_log}" "${_log}.rc"
             return 0
+        fi
+        # killed by the run bound (busybox timeout: 128 + signal; coreutils: 124)
+        if [ "${_rc}" -eq 124 ] || [ "${_rc}" -eq 143 ] || [ "${_rc}" -eq 137 ]; then
+            echo "WARNING: acme: lego for *.$2 at $1 killed after ${GATEWAY_ACME_RUN_TIMEOUT}s (GATEWAY_ACME_RUN_TIMEOUT)"
+            acme_cleanup_killed "${_log}"
         fi
         # The CA no longer knows the stored account (deactivated, EAB revoked, a test CA
         # restarted): set it aside and register a new one, once.

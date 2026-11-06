@@ -41,6 +41,11 @@ services:
     volumes:
       # GATEWAY_STATE_DIR: the mesh CA from the last good fetch, so a recreate works with the backend down
       - gateway-state:/var/lib/mesh-gateway
+    # nginx's 4096 worker_connections need two descriptors each; Docker 29 defaults to 1024
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/_health"]

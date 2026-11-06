@@ -303,12 +303,35 @@ services:
       - CACHE_TTL=60
       - GATEWAY_TLS_PORT=443
     volumes:
-      - gateway-state:/var/lib/mesh-gateway   # mesh CA kept across recreates
+      - gateway-state:/var/lib/mesh-gateway   # mesh CA, ACME accounts, certificates
+    # nginx's 4096 worker_connections need two descriptors each; Docker 29 defaults to 1024
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     restart: unless-stopped
 
 volumes:
   gateway-state:
 ```
+
+## Host changes
+
+**Rule:** what a gateway needs belongs in its compose file, and then nothing more is done.
+Anything that has to be done on the host outside the compose file is documented here, with
+why, together with the exact command or script that redoes it, so it isn't lost when the
+gateway moves to another server.
+
+Today there is one:
+
+- **The external Docker network `mesh-internal`.** The gateway and the tunnel provider are
+  two compose projects that reach each other at fixed addresses (`TUNNEL_VIA`,
+  `PROVIDER_ROUTE_IP`, `TUNNEL_FORWARD_FROM`), and compose can only share a network created
+  outside it. Each host has its own subnet; create it before the first `docker compose up`:
+  `docker network create --driver bridge --subnet <subnet> mesh-internal`. Each server's
+  gateway and tunnel compose files carry the exact command, with that host's subnet, next to
+  `mesh-internal: external: true`. Never recreate it on a running host: the static addresses
+  live in it.
 
 ## DNS Resolver Configuration (Important!)
 
